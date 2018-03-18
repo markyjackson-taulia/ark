@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,18 +19,22 @@ package controller
 import (
 	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/clock"
-	kuberrs "k8s.io/apimachinery/pkg/util/errors"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -38,28 +42,31 @@ import (
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
 	"github.com/heptio/ark/pkg/backup"
 	"github.com/heptio/ark/pkg/cloudprovider"
-	"github.com/heptio/ark/pkg/generated/clientset/scheme"
-	arkv1client "github.com/heptio/ark/pkg/generated/clientset/typed/ark/v1"
+	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
 	informers "github.com/heptio/ark/pkg/generated/informers/externalversions/ark/v1"
 	listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
+	"github.com/heptio/ark/pkg/plugin"
 	"github.com/heptio/ark/pkg/util/collections"
 	"github.com/heptio/ark/pkg/util/encode"
+	kubeutil "github.com/heptio/ark/pkg/util/kube"
+	"github.com/heptio/ark/pkg/util/stringslice"
 )
 
 const backupVersion = 1
 
 type backupController struct {
-	backupper     backup.Backupper
-	backupService cloudprovider.BackupService
-	bucket        string
-
-	lister       listers.BackupLister
-	listerSynced cache.InformerSynced
-	client       arkv1client.BackupsGetter
-	syncHandler  func(backupName string) error
-	queue        workqueue.RateLimitingInterface
-
-	clock clock.Clock
+	backupper        backup.Backupper
+	backupService    cloudprovider.BackupService
+	bucket           string
+	pvProviderExists bool
+	lister           listers.BackupLister
+	listerSynced     cache.InformerSynced
+	client           arkv1client.BackupsGetter
+	syncHandler      func(backupName string) error
+	queue            workqueue.RateLimitingInterface
+	clock            clock.Clock
+	logger           logrus.FieldLogger
+	pluginManager    plugin.Manager
 }
 
 func NewBackupController(
@@ -68,18 +75,22 @@ func NewBackupController(
 	backupper backup.Backupper,
 	backupService cloudprovider.BackupService,
 	bucket string,
+	pvProviderExists bool,
+	logger logrus.FieldLogger,
+	pluginManager plugin.Manager,
 ) Interface {
 	c := &backupController{
-		backupper:     backupper,
-		backupService: backupService,
-		bucket:        bucket,
-
-		lister:       backupInformer.Lister(),
-		listerSynced: backupInformer.Informer().HasSynced,
-		client:       client,
-		queue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "backup"),
-
-		clock: &clock.RealClock{},
+		backupper:        backupper,
+		backupService:    backupService,
+		bucket:           bucket,
+		pvProviderExists: pvProviderExists,
+		lister:           backupInformer.Lister(),
+		listerSynced:     backupInformer.Informer().HasSynced,
+		client:           client,
+		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "backup"),
+		clock:            &clock.RealClock{},
+		logger:           logger,
+		pluginManager:    pluginManager,
 	}
 
 	c.syncHandler = c.processBackup
@@ -93,13 +104,16 @@ func NewBackupController(
 				case "", api.BackupPhaseNew:
 					// only process new backups
 				default:
-					glog.V(4).Infof("Backup %s/%s has phase %s - skipping", backup.Namespace, backup.Name, backup.Status.Phase)
+					c.logger.WithFields(logrus.Fields{
+						"backup": kubeutil.NamespaceAndName(backup),
+						"phase":  backup.Status.Phase,
+					}).Debug("Backup is not new, skipping")
 					return
 				}
 
 				key, err := cache.MetaNamespaceKeyFunc(backup)
 				if err != nil {
-					glog.Errorf("error creating queue key for %#v: %v", backup, err)
+					c.logger.WithError(err).WithField("backup", backup).Error("Error creating queue key, item not added to queue")
 					return
 				}
 				c.queue.Add(key)
@@ -117,7 +131,7 @@ func (controller *backupController) Run(ctx context.Context, numWorkers int) err
 	var wg sync.WaitGroup
 
 	defer func() {
-		glog.Infof("Waiting for workers to finish their work")
+		controller.logger.Info("Waiting for workers to finish their work")
 
 		controller.queue.ShutDown()
 
@@ -126,17 +140,18 @@ func (controller *backupController) Run(ctx context.Context, numWorkers int) err
 		// we want to shut down the queue via defer and not at the end of the body.
 		wg.Wait()
 
-		glog.Infof("All workers have finished")
+		controller.logger.Info("All workers have finished")
+
 	}()
 
-	glog.Info("Starting BackupController")
-	defer glog.Infof("Shutting down BackupController")
+	controller.logger.Info("Starting BackupController")
+	defer controller.logger.Info("Shutting down BackupController")
 
-	glog.Info("Waiting for caches to sync")
+	controller.logger.Info("Waiting for caches to sync")
 	if !cache.WaitForCacheSync(ctx.Done(), controller.listerSynced) {
 		return errors.New("timed out waiting for caches to sync")
 	}
-	glog.Info("Caches are synced")
+	controller.logger.Info("Caches are synced")
 
 	wg.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
@@ -175,7 +190,7 @@ func (controller *backupController) processNextWorkItem() bool {
 		return true
 	}
 
-	glog.Errorf("syncHandler error: %v", err)
+	controller.logger.WithError(err).WithField("key", key).Error("Error in syncHandler, re-adding item to queue")
 	// we had an error processing the item so add it back
 	// into the queue for re-processing with rate-limiting
 	controller.queue.AddRateLimited(key)
@@ -184,27 +199,28 @@ func (controller *backupController) processNextWorkItem() bool {
 }
 
 func (controller *backupController) processBackup(key string) error {
-	glog.V(4).Infof("processBackup for key %q", key)
+	logContext := controller.logger.WithField("key", key)
+
+	logContext.Debug("Running processBackup")
 	ns, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		glog.V(4).Infof("error splitting key %q: %v", key, err)
-		return err
+		return errors.Wrap(err, "error splitting queue key")
 	}
 
-	glog.V(4).Infof("Getting backup %s", key)
+	logContext.Debug("Getting backup")
 	backup, err := controller.lister.Backups(ns).Get(name)
 	if err != nil {
-		glog.V(4).Infof("error getting backup %s: %v", key, err)
-		return err
+		return errors.Wrap(err, "error getting backup")
 	}
 
-	// TODO I think this is now unnecessary. We only initially place
-	// item with Phase = ("" | New) into the queue. Items will only get
-	// re-queued if syncHandler returns an error, which will only
-	// happen if there's an error updating Phase from its initial
-	// state to something else. So any time it's re-queued it will
-	// still have its initial state, which we've already confirmed
-	// is ("" | New)
+	// Double-check we have the correct phase. In the unlikely event that multiple controller
+	// instances are running, it's possible for controller A to succeed in changing the phase to
+	// InProgress, while controller B's attempt to patch the phase fails. When controller B
+	// reprocesses the same backup, it will either show up as New (informer hasn't seen the update
+	// yet) or as InProgress. In the former case, the patch attempt will fail again, until the
+	// informer sees the update. In the latter case, after the informer has seen the update to
+	// InProgress, we still need this check so we can return nil to indicate we've finished processing
+	// this key (even though it was a no-op).
 	switch backup.Status.Phase {
 	case "", api.BackupPhaseNew:
 		// only process new backups
@@ -212,25 +228,18 @@ func (controller *backupController) processBackup(key string) error {
 		return nil
 	}
 
-	glog.V(4).Infof("Cloning backup %s", key)
+	logContext.Debug("Cloning backup")
+	// store ref to original for creating patch
+	original := backup
 	// don't modify items in the cache
-	backup, err = cloneBackup(backup)
-	if err != nil {
-		glog.V(4).Infof("error cloning backup %s: %v", key, err)
-		return err
-	}
+	backup = backup.DeepCopy()
 
 	// set backup version
 	backup.Status.Version = backupVersion
 
-	// included resources defaulting
-	if len(backup.Spec.IncludedResources) == 0 {
-		backup.Spec.IncludedResources = []string{"*"}
-	}
-
-	// included namespace defaulting
-	if len(backup.Spec.IncludedNamespaces) == 0 {
-		backup.Spec.IncludedNamespaces = []string{"*"}
+	// add GC finalizer if it's not there already
+	if !stringslice.Has(backup.Finalizers, api.GCFinalizer) {
+		backup.Finalizers = append(backup.Finalizers, api.GCFinalizer)
 	}
 
 	// calculate expiration
@@ -246,98 +255,133 @@ func (controller *backupController) processBackup(key string) error {
 	}
 
 	// update status
-	updatedBackup, err := controller.client.Backups(ns).Update(backup)
+	updatedBackup, err := patchBackup(original, backup, controller.client)
 	if err != nil {
-		glog.V(4).Infof("error updating status to %s: %v", backup.Status.Phase, err)
-		return err
+		return errors.Wrapf(err, "error updating Backup status to %s", backup.Status.Phase)
 	}
-	backup = updatedBackup
+	// store ref to just-updated item for creating patch
+	original = updatedBackup
+	backup = updatedBackup.DeepCopy()
 
 	if backup.Status.Phase == api.BackupPhaseFailedValidation {
 		return nil
 	}
 
-	glog.V(4).Infof("running backup for %s", key)
+	logContext.Debug("Running backup")
 	// execution & upload of backup
 	if err := controller.runBackup(backup, controller.bucket); err != nil {
-		glog.V(4).Infof("backup %s failed: %v", key, err)
+		logContext.WithError(err).Error("backup failed")
 		backup.Status.Phase = api.BackupPhaseFailed
 	}
 
-	glog.V(4).Infof("updating backup %s final status", key)
-	if _, err = controller.client.Backups(ns).Update(backup); err != nil {
-		glog.V(4).Infof("error updating backup %s final status: %v", key, err)
+	logContext.Debug("Updating backup's final status")
+	if _, err := patchBackup(original, backup, controller.client); err != nil {
+		logContext.WithError(err).Error("error updating backup's final status")
 	}
 
 	return nil
 }
 
-func cloneBackup(in interface{}) (*api.Backup, error) {
-	clone, err := scheme.Scheme.DeepCopy(in)
+func patchBackup(original, updated *api.Backup, client arkv1client.BackupsGetter) (*api.Backup, error) {
+	origBytes, err := json.Marshal(original)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error marshalling original backup")
 	}
 
-	out, ok := clone.(*api.Backup)
-	if !ok {
-		return nil, fmt.Errorf("unexpected type: %T", clone)
+	updatedBytes, err := json.Marshal(updated)
+	if err != nil {
+		return nil, errors.Wrap(err, "error marshalling updated backup")
 	}
 
-	return out, nil
+	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(origBytes, updatedBytes, api.Backup{})
+	if err != nil {
+		return nil, errors.Wrap(err, "error creating two-way merge patch for backup")
+	}
+
+	res, err := client.Backups(original.Namespace).Patch(original.Name, types.MergePatchType, patchBytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "error patching backup")
+	}
+
+	return res, nil
 }
 
 func (controller *backupController) getValidationErrors(itm *api.Backup) []string {
 	var validationErrors []string
 
-	for err := range collections.ValidateIncludesExcludes(itm.Spec.IncludedResources, itm.Spec.ExcludedResources) {
+	for _, err := range collections.ValidateIncludesExcludes(itm.Spec.IncludedResources, itm.Spec.ExcludedResources) {
 		validationErrors = append(validationErrors, fmt.Sprintf("Invalid included/excluded resource lists: %v", err))
 	}
 
-	for err := range collections.ValidateIncludesExcludes(itm.Spec.IncludedNamespaces, itm.Spec.ExcludedNamespaces) {
+	for _, err := range collections.ValidateIncludesExcludes(itm.Spec.IncludedNamespaces, itm.Spec.ExcludedNamespaces) {
 		validationErrors = append(validationErrors, fmt.Sprintf("Invalid included/excluded namespace lists: %v", err))
+	}
+
+	if !controller.pvProviderExists && itm.Spec.SnapshotVolumes != nil && *itm.Spec.SnapshotVolumes {
+		validationErrors = append(validationErrors, "Server is not configured for PV snapshots")
 	}
 
 	return validationErrors
 }
 
 func (controller *backupController) runBackup(backup *api.Backup, bucket string) error {
+	log := controller.logger.WithField("backup", kubeutil.NamespaceAndName(backup))
+	log.Info("Starting backup")
+
+	logFile, err := ioutil.TempFile("", "")
+	if err != nil {
+		return errors.Wrap(err, "error creating temp file for backup log")
+	}
+	defer closeAndRemoveFile(logFile, log)
+
 	backupFile, err := ioutil.TempFile("", "")
 	if err != nil {
-		return err
+		return errors.Wrap(err, "error creating temp file for backup")
 	}
-	defer func() {
-		var errs []error
-		errs = append(errs, err)
+	defer closeAndRemoveFile(backupFile, log)
 
-		if closeErr := backupFile.Close(); closeErr != nil {
-			errs = append(errs, closeErr)
-		}
-
-		if removeErr := os.Remove(backupFile.Name()); removeErr != nil {
-			errs = append(errs, removeErr)
-		}
-		err = kuberrs.NewAggregate(errs)
-	}()
-
-	if err := controller.backupper.Backup(backup, backupFile); err != nil {
-		return err
-	}
-
-	// note: updating this here so the uploaded JSON shows "completed". If
-	// the upload fails, we'll alter the phase in the calling func.
-	glog.V(4).Infof("backup %s/%s completed", backup.Namespace, backup.Name)
-	backup.Status.Phase = api.BackupPhaseCompleted
-
-	buf := new(bytes.Buffer)
-	if err := encode.EncodeTo(backup, "json", buf); err != nil {
-		return err
-	}
-
-	// re-set the file offset to 0 for reading
-	_, err = backupFile.Seek(0, 0)
+	actions, err := controller.pluginManager.GetBackupItemActions(backup.Name)
 	if err != nil {
 		return err
 	}
+	defer controller.pluginManager.CloseBackupItemActions(backup.Name)
 
-	return controller.backupService.UploadBackup(bucket, backup.Name, bytes.NewReader(buf.Bytes()), backupFile)
+	var errs []error
+
+	var backupJsonToUpload, backupFileToUpload io.Reader
+
+	// Do the actual backup
+	if err := controller.backupper.Backup(backup, backupFile, logFile, actions); err != nil {
+		errs = append(errs, err)
+
+		backup.Status.Phase = api.BackupPhaseFailed
+	} else {
+		backup.Status.Phase = api.BackupPhaseCompleted
+	}
+
+	backupJson := new(bytes.Buffer)
+	if err := encode.EncodeTo(backup, "json", backupJson); err != nil {
+		errs = append(errs, errors.Wrap(err, "error encoding backup"))
+	} else {
+		// Only upload the json and backup tarball if encoding to json succeeded.
+		backupJsonToUpload = backupJson
+		backupFileToUpload = backupFile
+	}
+
+	if err := controller.backupService.UploadBackup(bucket, backup.Name, backupJsonToUpload, backupFileToUpload, logFile); err != nil {
+		errs = append(errs, err)
+	}
+
+	log.Info("Backup completed")
+
+	return kerrors.NewAggregate(errs)
+}
+
+func closeAndRemoveFile(file *os.File, log logrus.FieldLogger) {
+	if err := file.Close(); err != nil {
+		log.WithError(err).WithField("file", file.Name()).Error("error closing file")
+	}
+	if err := os.Remove(file.Name()); err != nil {
+		log.WithError(err).WithField("file", file.Name()).Error("error removing file")
+	}
 }

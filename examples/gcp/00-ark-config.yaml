@@ -1,4 +1,4 @@
-# Copyright 2017 Heptio Inc.
+# Copyright 2017 the Heptio Ark contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,14 +19,10 @@ metadata:
   namespace: heptio-ark
   name: default
 persistentVolumeProvider:
-  gcp:
-    project: <YOUR_PROJECT>
-    zone: <YOUR_ZONE>
+  name: gcp
 backupStorageProvider:
+  name: gcp
   bucket: <YOUR_BUCKET>
-  gcp:
-    project: <YOUR_PROJECT>
-    zone: <YOUR_ZONE>
 backupSyncPeriod: 30m
 gcSyncPeriod: 30m
 scheduleSyncPeriod: 1m

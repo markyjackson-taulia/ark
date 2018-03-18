@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,10 @@ limitations under the License.
 package backup
 
 import (
-	"errors"
 	"fmt"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
@@ -33,11 +33,11 @@ import (
 	"github.com/heptio/ark/pkg/cmd/util/output"
 )
 
-func NewCreateCommand(f client.Factory) *cobra.Command {
+func NewCreateCommand(f client.Factory, use string) *cobra.Command {
 	o := NewCreateOptions()
 
 	c := &cobra.Command{
-		Use:   "create NAME",
+		Use:   use + " NAME",
 		Short: "Create a backup",
 		Run: func(c *cobra.Command, args []string) {
 			cmd.CheckError(o.Validate(c, args))
@@ -54,34 +54,43 @@ func NewCreateCommand(f client.Factory) *cobra.Command {
 }
 
 type CreateOptions struct {
-	Name              string
-	TTL               time.Duration
-	SnapshotVolumes   bool
-	IncludeNamespaces flag.StringArray
-	ExcludeNamespaces flag.StringArray
-	IncludeResources  flag.StringArray
-	ExcludeResources  flag.StringArray
-	Labels            flag.Map
-	Selector          flag.LabelSelector
+	Name                    string
+	TTL                     time.Duration
+	SnapshotVolumes         flag.OptionalBool
+	IncludeNamespaces       flag.StringArray
+	ExcludeNamespaces       flag.StringArray
+	IncludeResources        flag.StringArray
+	ExcludeResources        flag.StringArray
+	Labels                  flag.Map
+	Selector                flag.LabelSelector
+	IncludeClusterResources flag.OptionalBool
 }
 
 func NewCreateOptions() *CreateOptions {
 	return &CreateOptions{
-		TTL:               24 * time.Hour,
-		IncludeNamespaces: flag.NewStringArray("*"),
-		Labels:            flag.NewMap(),
+		TTL:                     30 * 24 * time.Hour,
+		IncludeNamespaces:       flag.NewStringArray("*"),
+		Labels:                  flag.NewMap(),
+		SnapshotVolumes:         flag.NewOptionalBool(nil),
+		IncludeClusterResources: flag.NewOptionalBool(nil),
 	}
 }
 
 func (o *CreateOptions) BindFlags(flags *pflag.FlagSet) {
 	flags.DurationVar(&o.TTL, "ttl", o.TTL, "how long before the backup can be garbage collected")
-	flags.BoolVar(&o.SnapshotVolumes, "snapshot-volumes", o.SnapshotVolumes, "take snapshots of PersistentVolumes as part of the backup")
 	flags.Var(&o.IncludeNamespaces, "include-namespaces", "namespaces to include in the backup (use '*' for all namespaces)")
 	flags.Var(&o.ExcludeNamespaces, "exclude-namespaces", "namespaces to exclude from the backup")
 	flags.Var(&o.IncludeResources, "include-resources", "resources to include in the backup, formatted as resource.group, such as storageclasses.storage.k8s.io (use '*' for all resources)")
 	flags.Var(&o.ExcludeResources, "exclude-resources", "resources to exclude from the backup, formatted as resource.group, such as storageclasses.storage.k8s.io")
 	flags.Var(&o.Labels, "labels", "labels to apply to the backup")
 	flags.VarP(&o.Selector, "selector", "l", "only back up resources matching this label selector")
+	f := flags.VarPF(&o.SnapshotVolumes, "snapshot-volumes", "", "take snapshots of PersistentVolumes as part of the backup")
+	// this allows the user to just specify "--snapshot-volumes" as shorthand for "--snapshot-volumes=true"
+	// like a normal bool flag
+	f.NoOptDefVal = "true"
+
+	f = flags.VarPF(&o.IncludeClusterResources, "include-cluster-resources", "", "include cluster-scoped resources in the backup")
+	f.NoOptDefVal = "true"
 }
 
 func (o *CreateOptions) Validate(c *cobra.Command, args []string) error {
@@ -109,7 +118,7 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 
 	backup := &api.Backup{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: api.DefaultNamespace,
+			Namespace: f.Namespace(),
 			Name:      o.Name,
 			Labels:    o.Labels.Data(),
 		},
@@ -119,8 +128,9 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 			IncludedResources:  o.IncludeResources,
 			ExcludedResources:  o.ExcludeResources,
 			LabelSelector:      o.Selector.LabelSelector,
-			SnapshotVolumes:    o.SnapshotVolumes,
+			SnapshotVolumes:    o.SnapshotVolumes.Value,
 			TTL:                metav1.Duration{Duration: o.TTL},
+			IncludeClusterResources: o.IncludeClusterResources.Value,
 		},
 	}
 
@@ -133,6 +143,7 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 		return err
 	}
 
-	fmt.Printf("Backup %q created successfully.\n", backup.Name)
+	fmt.Printf("Backup request %q submitted successfully.\n", backup.Name)
+	fmt.Printf("Run `ark backup describe %s` for more details.\n", backup.Name)
 	return nil
 }

@@ -1,9 +1,9 @@
 # Ark Config definition
 
-* [Overview][10]
-* [Example][11]
-* [Parameter Reference][8]
-  * [Main config][9]
+* [Overview][8]
+* [Example][9]
+* [Parameter Reference][6]
+  * [Main config][7]
   * [AWS][0]
   * [GCP][1]
   * [Azure][2]
@@ -24,18 +24,14 @@ metadata:
   namespace: heptio-ark
   name: default
 persistentVolumeProvider:
-  aws:
-    region: minio
-    availabilityZone: minio
-    s3ForcePathStyle: true
-    s3Url: http://minio:9000
+  name: aws
+  config:
+    region: us-west-2
 backupStorageProvider:
+  name: aws
   bucket: ark
-  aws:
-    region: minio
-    availabilityZone: minio
-    s3ForcePathStyle: true
-    s3Url: http://minio:9000
+  config:
+    region: us-west-2
 backupSyncPeriod: 60m
 gcSyncPeriod: 60m
 scheduleSyncPeriod: 1m
@@ -50,9 +46,13 @@ The configurable parameters are as follows:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `persistentVolumeProvider` | CloudProviderConfig<br><br>(Supported key values are `aws`, `gcp`, and `azure`, but only one can be present. See the corresponding [AWS][0], [GCP][1], and [Azure][2]-specific configs.) | Required Field | The specification for whichever cloud provider the cluster is using for persistent volumes (to be snapshotted).<br><br> *NOTE*: For Azure, your Kubernetes cluster needs to be version 1.7.2+ in order to support PV snapshotting of its managed disks. |
-| `backupStorageProvider`/(inline) | CloudProviderConfig<br><br>(Supported key values are `aws`, `gcp`, and `azure`, but only one can be present. See the corresponding [AWS][0], [GCP][1], and [Azure][2]-specific configs.) | Required Field | The specification for whichever cloud provider will be used to actually store the backups. |
+| `persistentVolumeProvider` | CloudProviderConfig | None (Optional) | The specification for whichever cloud provider the cluster is using for persistent volumes (to be snapshotted), if any.<br><br>If not specified, Backups and Restores requesting PV snapshots & restores, respectively, are considered invalid. <br><br> *NOTE*: For Azure, your Kubernetes cluster needs to be version 1.7.2+ in order to support PV snapshotting of its managed disks. |
+| `persistentVolumeProvider/name` | String<br><br>(Ark natively supports `aws`, `gcp`, and `azure`. Other providers may be available via external plugins.) | None (Optional) | The name of the cloud provider the cluster is using for persistent volumes, if any. |
+| `persistentVolumeProvider/config` | map[string]string<br><br>(See the corresponding [AWS][0], [GCP][1], and [Azure][2]-specific configs or your provider's documentation.) | None (Optional) | Configuration keys/values to be passed to the cloud provider for persistent volumes.  |
+| `backupStorageProvider` | CloudProviderConfig | Required Field | The specification for whichever cloud provider will be used to actually store the backups. |
+| `backupStorageProvider/name` | String<br><br>(Ark natively supports `aws`, `gcp`, and `azure`. Other providers may be available via external plugins.) | Required Field | The name of the cloud provider that will be used to actually store the backups. |
 | `backupStorageProvider/bucket` | String | Required Field | The storage bucket where backups are to be uploaded. |
+| `backupStorageProvider/config` | map[string]string<br><br>(See the corresponding [AWS][0], [GCP][1], and [Azure][2]-specific configs or your provider's documentation.) | None (Optional) | Configuration keys/values to be passed to the cloud provider for backup storage. |
 | `backupSyncPeriod` | metav1.Duration | 60m0s | How frequently Ark queries the object storage to make sure that the appropriate Backup resources have been created for existing backup files. |
 | `gcSyncPeriod` | metav1.Duration | 60m0s | How frequently Ark queries the object storage to delete backup files that have passed their TTL. |
 | `scheduleSyncPeriod` | metav1.Duration | 1m0s | How frequently Ark checks its Schedule resource objects to see if a backup needs to be initiated. |
@@ -63,35 +63,49 @@ The configurable parameters are as follows:
 
 **(Or other S3-compatible storage)**
 
+#### backupStorageProvider/config
+
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `region` | string | Required Field | *Example*: "us-east-1"<br><br>See [AWS documentation][3] for the full list. |
-| `availabilityZone` | string | Required Field | *Example*: "us-east-1a"<br><br>See [AWS documentation][4] for details. |
-| `disableSSL` | bool | `false` | Set this to `true` if you are using Minio (or another local, S3-compatible storage service) and your deployment is not secured. |
 | `s3ForcePathStyle` | bool | `false` | Set this to `true` if you are using a local storage service like Minio. |
-| `s3Url` | string | Required field for non-AWS-hosted storage| *Example*: http://minio:9000<br><br>You can specify the AWS S3 URL here for explicitness, but Ark can already generate it from `region`, `availabilityZone`, and `bucket`. This field is primarily for local sotrage services like Minio.|
+| `s3Url` | string | Required field for non-AWS-hosted storage| *Example*: http://minio:9000<br><br>You can specify the AWS S3 URL here for explicitness, but Ark can already generate it from `region`, and `bucket`. This field is primarily for local storage services like Minio.|
+| `kmsKeyId` | string | Empty | *Example*: "502b409c-4da1-419f-a16e-eif453b3i49f" or "alias/`<KMS-Key-Alias-Name>`"<br><br>Specify an [AWS KMS key][10] id or alias to enable encryption of the backups stored in S3. Only works with AWS S3 and may require explicitly granting key usage rights.|
+
+#### persistentVolumeProvider/config (AWS Only)
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `region` | string | Required Field | *Example*: "us-east-1"<br><br>See [AWS documentation][3] for the full list. |
 
 ### GCP
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `project` | string | Required Field | *Example*: "project-example-3jsn23"<br><br> See the [Project ID documentation][5] for details. |
-| `zone` | string | Required Field | *Example*: "us-central1-a"<br><br>See [GCP documentation][6] for the full list. |
+
+#### backupStorageProvider/config
+
+No parameters required.
+
+#### persistentVolumeProvider/config
+
+No parameters required.
 
 ### Azure
+
+#### backupStorageProvider/config
+
+No parameters required.
+
+#### persistentVolumeProvider/config
+
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `location` | string | Required Field | *Example*: "Canada East"<br><br>See [the list of available locations][7] (note that this particular page refers to them as "Regions"). |
-| `apiTimeout` | metav1.Duration | 1m0s | How long to wait for an API Azure request to complete before timeout. |
+| `apiTimeout` | metav1.Duration | 2m0s | How long to wait for an Azure API request to complete before timeout. |
 
 [0]: #aws
 [1]: #gcp
 [2]: #azure
 [3]: http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html#concepts-available-regions
-[4]: http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html#concepts-availability-zones
-[5]: https://cloud.google.com/resource-manager/docs/creating-managing-projects#identifying_projects
-[6]: https://cloud.google.com/compute/docs/regions-zones/regions-zones
-[7]: https://azure.microsoft.com/en-us/regions/
-[8]: #parameter-reference
-[9]: #main-config-parameters
-[10]: #overview
-[11]: #example
+[6]: #parameter-reference
+[7]: #main-config-parameters
+[8]: #overview
+[9]: #example
+[10]: http://docs.aws.amazon.com/kms/latest/developerguide/overview.html

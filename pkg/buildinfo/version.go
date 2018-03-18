@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,14 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package buildinfo holds build-time information like the sonobuoy version.
+// Package buildinfo holds build-time information like the ark version.
 // This is a separate package so that other packages can import it without
 // worrying about introducing circular dependencies.
 package buildinfo
 
-// Version is the current version of Ark, set by the go linker's -X flag at build time.
-var Version string
+import "fmt"
 
-// DockerImage is the full path to the docker image for this build, for example
-// gcr.io/heptio-images/ark.
-var DockerImage string
+var (
+	// Version is the current version of Ark, set by the go linker's -X flag at build time.
+	Version string
+
+	// GitSHA is the actual commit that is being built, set by the go linker's -X flag at build time.
+	GitSHA string
+
+	// GitTreeState indicates if the git tree is clean or dirty, set by the go linker's -X flag at build
+	// time.
+	GitTreeState string
+)
+
+// FormattedGitSHA renders the Git SHA with an indicator of the tree state.
+func FormattedGitSHA() string {
+	if GitTreeState != "clean" {
+		return fmt.Sprintf("%s-%s", GitSHA, GitTreeState)
+	}
+	return GitSHA
+}

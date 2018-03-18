@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/pkg/errors"
+
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/generated/clientset/scheme"
+	"github.com/heptio/ark/pkg/generated/clientset/versioned/scheme"
 )
 
 // Encode converts the provided object to the specified format
@@ -46,7 +48,7 @@ func EncodeTo(obj runtime.Object, format string, w io.Writer) error {
 		return err
 	}
 
-	return encoder.Encode(obj, w)
+	return errors.WithStack(encoder.Encode(obj, w))
 }
 
 // EncoderFor gets the appropriate encoder for the specified format.
@@ -55,7 +57,7 @@ func EncoderFor(format string) (runtime.Encoder, error) {
 	desiredMediaType := fmt.Sprintf("application/%s", format)
 	serializerInfo, found := runtime.SerializerInfoForMediaType(scheme.Codecs.SupportedMediaTypes(), desiredMediaType)
 	if !found {
-		return nil, fmt.Errorf("unable to locate an encoder for %q", desiredMediaType)
+		return nil, errors.Errorf("unable to locate an encoder for %q", desiredMediaType)
 	}
 	if serializerInfo.PrettySerializer != nil {
 		encoder = serializerInfo.PrettySerializer

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,23 +23,33 @@ import (
 
 	"github.com/heptio/ark/pkg/client"
 	"github.com/heptio/ark/pkg/cmd/cli/backup"
+	cliclient "github.com/heptio/ark/pkg/cmd/cli/client"
+	"github.com/heptio/ark/pkg/cmd/cli/create"
+	"github.com/heptio/ark/pkg/cmd/cli/delete"
+	"github.com/heptio/ark/pkg/cmd/cli/describe"
+	"github.com/heptio/ark/pkg/cmd/cli/get"
+	"github.com/heptio/ark/pkg/cmd/cli/plugin"
 	"github.com/heptio/ark/pkg/cmd/cli/restore"
 	"github.com/heptio/ark/pkg/cmd/cli/schedule"
 	"github.com/heptio/ark/pkg/cmd/server"
+	runplugin "github.com/heptio/ark/pkg/cmd/server/plugin"
 	"github.com/heptio/ark/pkg/cmd/version"
 )
 
 func NewCommand(name string) *cobra.Command {
 	c := &cobra.Command{
-		Use: name,
+		Use:   name,
 		Short: "Back up and restore Kubernetes cluster resources.",
-		Long: `Heptio Ark is a tool for managing disaster recovery, specifically for
-Kubernetes cluster resources. It provides a simple, configurable,
-and operationally robust way to back up your application state and
-associated data.`,
+		Long: `Heptio Ark is a tool for managing disaster recovery, specifically for Kubernetes
+cluster resources. It provides a simple, configurable, and operationally robust
+way to back up your application state and associated data.
+
+If you're familiar with kubectl, Ark supports a similar model, allowing you to
+execute commands such as 'ark get backup' and 'ark create schedule'. The same
+operations can also be performed as 'ark backup get' and 'ark schedule create'.`,
 	}
 
-	f := client.NewFactory()
+	f := client.NewFactory(name)
 	f.BindFlags(c.PersistentFlags())
 
 	c.AddCommand(
@@ -48,10 +58,22 @@ associated data.`,
 		restore.NewCommand(f),
 		server.NewCommand(),
 		version.NewCommand(),
+		get.NewCommand(f),
+		describe.NewCommand(f),
+		create.NewCommand(f),
+		runplugin.NewCommand(),
+		plugin.NewCommand(f),
+		delete.NewCommand(f),
+		cliclient.NewCommand(),
 	)
 
 	// add the glog flags
 	c.PersistentFlags().AddGoFlagSet(flag.CommandLine)
+
+	// TODO: switch to a different logging library.
+	// Work around https://github.com/golang/glog/pull/13.
+	// See also https://github.com/kubernetes/kubernetes/issues/17162
+	flag.CommandLine.Parse([]string{})
 
 	return c
 }

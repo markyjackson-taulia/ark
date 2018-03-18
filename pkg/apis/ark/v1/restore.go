@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,8 +24,21 @@ type RestoreSpec struct {
 	// from.
 	BackupName string `json:"backupName"`
 
-	// Namespaces is a slice of namespaces in the Ark backup to restore.
-	Namespaces []string `json:"namespaces"`
+	// IncludedNamespaces is a slice of namespace names to include objects
+	// from. If empty, all namespaces are included.
+	IncludedNamespaces []string `json:"includedNamespaces"`
+
+	// ExcludedNamespaces contains a list of namespaces that are not
+	// included in the restore.
+	ExcludedNamespaces []string `json:"excludedNamespaces"`
+
+	// IncludedResources is a slice of resource names to include
+	// in the restore. If empty, all resources in the backup are included.
+	IncludedResources []string `json:"includedResources"`
+
+	// ExcludedResources is a slice of resource names that are not
+	// included in the restore.
+	ExcludedResources []string `json:"excludedResources"`
 
 	// NamespaceMapping is a map of source namespace names
 	// to target namespace names to restore into. Any source
@@ -38,9 +51,14 @@ type RestoreSpec struct {
 	// or nil, all objects are included. Optional.
 	LabelSelector *metav1.LabelSelector `json:"labelSelector"`
 
-	// RestorePVs is a bool defining whether to restore all included
-	// PVs from snapshot (via the cloudprovider). Default false.
-	RestorePVs bool `json:"restorePVs"`
+	// RestorePVs specifies whether to restore all included
+	// PVs from snapshot (via the cloudprovider).
+	RestorePVs *bool `json:"restorePVs"`
+
+	// IncludeClusterResources specifies whether cluster-scoped resources
+	// should be included for consideration in the restore. If null, defaults
+	// to true.
+	IncludeClusterResources *bool `json:"includeClusterResources"`
 }
 
 // RestorePhase is a string representation of the lifecycle phase
@@ -73,13 +91,13 @@ type RestoreStatus struct {
 	// applicable)
 	ValidationErrors []string `json:"validationErrors"`
 
-	// Warnings is a collection of all warning messages that were
-	// generated during execution of the restore
-	Warnings RestoreResult `json:"warnings"`
+	// Warnings is a count of all warning messages that were generated during
+	// execution of the restore. The actual warnings are stored in object storage.
+	Warnings int `json:"warnings"`
 
-	// Errors is a collection of all error messages that were
-	// generated during execution of the restore
-	Errors RestoreResult `json:"errors"`
+	// Errors is a count of all error messages that were generated during
+	// execution of the restore. The actual errors are stored in object storage.
+	Errors int `json:"errors"`
 }
 
 // RestoreResult is a collection of messages that were generated
@@ -100,7 +118,8 @@ type RestoreResult struct {
 	Namespaces map[string][]string `json:"namespaces"`
 }
 
-// +genclient=true
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // Restore is an Ark resource that represents the application of
 // resources from an Ark backup to a target Kubernetes cluster.
@@ -111,6 +130,8 @@ type Restore struct {
 	Spec   RestoreSpec   `json:"spec"`
 	Status RestoreStatus `json:"status,omitempty"`
 }
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // RestoreList is a list of Restores.
 type RestoreList struct {

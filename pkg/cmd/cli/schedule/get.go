@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,11 +27,11 @@ import (
 	"github.com/heptio/ark/pkg/cmd/util/output"
 )
 
-func NewGetCommand(f client.Factory) *cobra.Command {
+func NewGetCommand(f client.Factory, use string) *cobra.Command {
 	var listOptions metav1.ListOptions
 
 	c := &cobra.Command{
-		Use:   "get",
+		Use:   use,
 		Short: "Get schedules",
 		Run: func(c *cobra.Command, args []string) {
 			err := output.ValidateFlags(c)
@@ -44,12 +44,12 @@ func NewGetCommand(f client.Factory) *cobra.Command {
 			if len(args) > 0 {
 				schedules = new(api.ScheduleList)
 				for _, name := range args {
-					schedule, err := arkClient.Ark().Schedules(api.DefaultNamespace).Get(name, metav1.GetOptions{})
+					schedule, err := arkClient.Ark().Schedules(f.Namespace()).Get(name, metav1.GetOptions{})
 					cmd.CheckError(err)
 					schedules.Items = append(schedules.Items, *schedule)
 				}
 			} else {
-				schedules, err = arkClient.ArkV1().Schedules(api.DefaultNamespace).List(metav1.ListOptions{})
+				schedules, err = arkClient.ArkV1().Schedules(f.Namespace()).List(listOptions)
 				cmd.CheckError(err)
 			}
 

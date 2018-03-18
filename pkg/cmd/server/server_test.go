@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,13 +23,17 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/heptio/ark/pkg/apis/ark/v1"
+	arktest "github.com/heptio/ark/pkg/util/test"
 )
 
 func TestApplyConfigDefaults(t *testing.T) {
-	c := &v1.Config{}
+	var (
+		logger = arktest.NewLogger()
+		c      = &v1.Config{}
+	)
 
 	// test defaulting
-	applyConfigDefaults(c)
+	applyConfigDefaults(c, logger)
 	assert.Equal(t, defaultGCSyncPeriod, c.GCSyncPeriod.Duration)
 	assert.Equal(t, defaultBackupSyncPeriod, c.BackupSyncPeriod.Duration)
 	assert.Equal(t, defaultScheduleSyncPeriod, c.ScheduleSyncPeriod.Duration)
@@ -41,8 +45,7 @@ func TestApplyConfigDefaults(t *testing.T) {
 	c.ScheduleSyncPeriod.Duration = 3 * time.Minute
 	c.ResourcePriorities = []string{"a", "b"}
 
-	applyConfigDefaults(c)
-
+	applyConfigDefaults(c, logger)
 	assert.Equal(t, 5*time.Minute, c.GCSyncPeriod.Duration)
 	assert.Equal(t, 4*time.Minute, c.BackupSyncPeriod.Duration)
 	assert.Equal(t, 3*time.Minute, c.ScheduleSyncPeriod.Duration)

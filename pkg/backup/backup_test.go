@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,102 +17,127 @@ limitations under the License.
 package backup
 
 import (
-	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
-	"errors"
 	"io"
 	"reflect"
 	"sort"
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/sets"
-
-	"github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/util/collections"
-	. "github.com/heptio/ark/pkg/util/test"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/heptio/ark/pkg/apis/ark/v1"
+	"github.com/heptio/ark/pkg/client"
+	"github.com/heptio/ark/pkg/cloudprovider"
+	"github.com/heptio/ark/pkg/discovery"
+	"github.com/heptio/ark/pkg/util/collections"
+	kubeutil "github.com/heptio/ark/pkg/util/kube"
+	arktest "github.com/heptio/ark/pkg/util/test"
+)
+
+var (
+	trueVal      = true
+	falseVal     = false
+	truePointer  = &trueVal
+	falsePointer = &falseVal
 )
 
 type fakeAction struct {
-	ids     []string
-	backups []*v1.Backup
+	selector        ResourceSelector
+	ids             []string
+	backups         []v1.Backup
+	additionalItems []ResourceIdentifier
 }
 
-var _ Action = &fakeAction{}
+var _ ItemAction = &fakeAction{}
 
-func (a *fakeAction) Execute(item map[string]interface{}, backup *v1.Backup) error {
-	metadata, err := collections.GetMap(item, "metadata")
+func newFakeAction(resource string) *fakeAction {
+	return (&fakeAction{}).ForResource(resource)
+}
+
+func (a *fakeAction) Execute(item runtime.Unstructured, backup *v1.Backup) (runtime.Unstructured, []ResourceIdentifier, error) {
+	metadata, err := meta.Accessor(item)
 	if err != nil {
-		return err
+		return item, a.additionalItems, err
 	}
+	a.ids = append(a.ids, kubeutil.NamespaceAndName(metadata))
+	a.backups = append(a.backups, *backup)
 
-	var id string
+	return item, a.additionalItems, nil
+}
 
-	if v, ok := metadata["namespace"]; ok {
-		id = v.(string) + "/"
-	}
+func (a *fakeAction) AppliesTo() (ResourceSelector, error) {
+	return a.selector, nil
+}
 
-	if v, ok := metadata["name"]; ok {
-		id += v.(string)
-	}
-
-	a.ids = append(a.ids, id)
-	a.backups = append(a.backups, backup)
-
-	return nil
+func (a *fakeAction) ForResource(resource string) *fakeAction {
+	a.selector.IncludedResources = []string{resource}
+	return a
 }
 
 func TestResolveActions(t *testing.T) {
 	tests := []struct {
 		name                string
-		input               map[string]Action
-		expected            map[schema.GroupResource]Action
+		input               []ItemAction
+		expected            []resolvedAction
 		resourcesWithErrors []string
 		expectError         bool
 	}{
 		{
 			name:     "empty input",
-			input:    map[string]Action{},
-			expected: map[schema.GroupResource]Action{},
+			input:    []ItemAction{},
+			expected: nil,
 		},
 		{
-			name:        "mapper error",
-			input:       map[string]Action{"badresource": &fakeAction{}},
-			expected:    map[schema.GroupResource]Action{},
+			name:        "resolve error",
+			input:       []ItemAction{&fakeAction{selector: ResourceSelector{LabelSelector: "=invalid-selector"}}},
+			expected:    nil,
 			expectError: true,
 		},
 		{
 			name:  "resolved",
-			input: map[string]Action{"foo": &fakeAction{}, "bar": &fakeAction{}},
-			expected: map[schema.GroupResource]Action{
-				schema.GroupResource{Group: "somegroup", Resource: "foodies"}:      &fakeAction{},
-				schema.GroupResource{Group: "anothergroup", Resource: "barnacles"}: &fakeAction{},
+			input: []ItemAction{newFakeAction("foo"), newFakeAction("bar")},
+			expected: []resolvedAction{
+				{
+					ItemAction:                newFakeAction("foo"),
+					resourceIncludesExcludes:  collections.NewIncludesExcludes().Includes("foodies.somegroup"),
+					namespaceIncludesExcludes: collections.NewIncludesExcludes(),
+					selector:                  labels.Everything(),
+				},
+				{
+					ItemAction:                newFakeAction("bar"),
+					resourceIncludesExcludes:  collections.NewIncludesExcludes().Includes("barnacles.anothergroup"),
+					namespaceIncludesExcludes: collections.NewIncludesExcludes(),
+					selector:                  labels.Everything(),
+				},
 			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			mapper := &FakeMapper{
-				Resources: map[schema.GroupVersionResource]schema.GroupVersionResource{
-					schema.GroupVersionResource{Resource: "foo"}: schema.GroupVersionResource{Group: "somegroup", Resource: "foodies"},
-					schema.GroupVersionResource{Resource: "fie"}: schema.GroupVersionResource{Group: "somegroup", Resource: "fields"},
-					schema.GroupVersionResource{Resource: "bar"}: schema.GroupVersionResource{Group: "anothergroup", Resource: "barnacles"},
-					schema.GroupVersionResource{Resource: "baz"}: schema.GroupVersionResource{Group: "anothergroup", Resource: "bazaars"},
-				},
+			resources := map[schema.GroupVersionResource]schema.GroupVersionResource{
+				{Resource: "foo"}: {Group: "somegroup", Resource: "foodies"},
+				{Resource: "fie"}: {Group: "somegroup", Resource: "fields"},
+				{Resource: "bar"}: {Group: "anothergroup", Resource: "barnacles"},
+				{Resource: "baz"}: {Group: "anothergroup", Resource: "bazaars"},
 			}
+			discoveryHelper := arktest.NewFakeDiscoveryHelper(false, resources)
 
-			actual, err := resolveActions(mapper, test.input)
+			actual, err := resolveActions(test.input, discoveryHelper)
 			gotError := err != nil
 
 			if e, a := test.expectError, gotError; e != a {
@@ -122,9 +147,7 @@ func TestResolveActions(t *testing.T) {
 				return
 			}
 
-			if e, a := test.expected, actual; !reflect.DeepEqual(e, a) {
-				t.Errorf("expected %v, got %v", e, a)
-			}
+			assert.Equal(t, test.expected, actual)
 		})
 	}
 }
@@ -164,27 +187,26 @@ func TestGetResourceIncludesExcludes(t *testing.T) {
 			expectedIncludes: []string{"foodies.somegroup", "fields.somegroup"},
 			expectedExcludes: []string{"barnacles.anothergroup", "bazaars.anothergroup"},
 		},
+		{
+			name:             "some unresolvable",
+			includes:         []string{"foo", "fie", "bad1"},
+			excludes:         []string{"bar", "baz", "bad2"},
+			expectedIncludes: []string{"foodies.somegroup", "fields.somegroup"},
+			expectedExcludes: []string{"barnacles.anothergroup", "bazaars.anothergroup"},
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			mapper := &FakeMapper{
-				Resources: map[schema.GroupVersionResource]schema.GroupVersionResource{
-					schema.GroupVersionResource{Resource: "foo"}: schema.GroupVersionResource{Group: "somegroup", Resource: "foodies"},
-					schema.GroupVersionResource{Resource: "fie"}: schema.GroupVersionResource{Group: "somegroup", Resource: "fields"},
-					schema.GroupVersionResource{Resource: "bar"}: schema.GroupVersionResource{Group: "anothergroup", Resource: "barnacles"},
-					schema.GroupVersionResource{Resource: "baz"}: schema.GroupVersionResource{Group: "anothergroup", Resource: "bazaars"},
-				},
+			resources := map[schema.GroupVersionResource]schema.GroupVersionResource{
+				{Resource: "foo"}: {Group: "somegroup", Resource: "foodies"},
+				{Resource: "fie"}: {Group: "somegroup", Resource: "fields"},
+				{Resource: "bar"}: {Group: "anothergroup", Resource: "barnacles"},
+				{Resource: "baz"}: {Group: "anothergroup", Resource: "bazaars"},
 			}
+			discoveryHelper := arktest.NewFakeDiscoveryHelper(false, resources)
 
-			backup := &v1.Backup{
-				Spec: v1.BackupSpec{
-					IncludedResources: test.includes,
-					ExcludedResources: test.excludes,
-				},
-			}
-
-			actual := getResourceIncludesExcludes(mapper, backup)
+			actual := getResourceIncludesExcludes(discoveryHelper, test.includes, test.excludes)
 
 			sort.Strings(test.expectedIncludes)
 			actualIncludes := actual.GetIncludes()
@@ -230,37 +252,13 @@ func TestGetNamespaceIncludesExcludes(t *testing.T) {
 	}
 }
 
-type fakeDiscoveryHelper struct {
-	resources []*metav1.APIResourceList
-	mapper    meta.RESTMapper
-}
-
-func (dh *fakeDiscoveryHelper) Resources() []*metav1.APIResourceList {
-	return dh.resources
-}
-
-func (dh *fakeDiscoveryHelper) Mapper() meta.RESTMapper {
-	return dh.mapper
-}
-
-func (dh *fakeDiscoveryHelper) Refresh() error {
-	return nil
-}
-
-func TestBackupMethod(t *testing.T) {
-	// TODO ensure LabelSelector is passed through to the List() calls
-	backup := &v1.Backup{
-		Spec: v1.BackupSpec{
-			// cm - shortcut in legacy api group, namespaced
-			// csr - shortcut in certificates.k8s.io api group, cluster-scoped
-			// roles - fully qualified in rbac.authorization.k8s.io api group, namespaced
-			IncludedResources:  []string{"cm", "csr", "roles"},
-			IncludedNamespaces: []string{"a", "b"},
-			ExcludedNamespaces: []string{"c", "d"},
-		},
+var (
+	v1Group = &metav1.APIResourceList{
+		GroupVersion: "v1",
+		APIResources: []metav1.APIResource{configMapsResource, podsResource, namespacesResource},
 	}
 
-	configMapsResource := metav1.APIResource{
+	configMapsResource = metav1.APIResource{
 		Name:         "configmaps",
 		SingularName: "configmap",
 		Namespaced:   true,
@@ -270,7 +268,7 @@ func TestBackupMethod(t *testing.T) {
 		Categories:   []string{"all"},
 	}
 
-	podsResource := metav1.APIResource{
+	podsResource = metav1.APIResource{
 		Name:         "pods",
 		SingularName: "pod",
 		Namespaced:   true,
@@ -280,7 +278,12 @@ func TestBackupMethod(t *testing.T) {
 		Categories:   []string{"all"},
 	}
 
-	rolesResource := metav1.APIResource{
+	rbacGroup = &metav1.APIResourceList{
+		GroupVersion: "rbac.authorization.k8s.io/v1beta1",
+		APIResources: []metav1.APIResource{rolesResource},
+	}
+
+	rolesResource = metav1.APIResource{
 		Name:         "roles",
 		SingularName: "role",
 		Namespaced:   true,
@@ -288,7 +291,20 @@ func TestBackupMethod(t *testing.T) {
 		Verbs:        metav1.Verbs([]string{"create", "update", "get", "list", "watch", "delete"}),
 	}
 
-	certificateSigningRequestsResource := metav1.APIResource{
+	namespacesResource = metav1.APIResource{
+		Name:         "namespaces",
+		SingularName: "namespace",
+		Namespaced:   false,
+		Kind:         "Namespace",
+		Verbs:        metav1.Verbs([]string{"create", "update", "get", "list", "watch", "delete"}),
+	}
+
+	certificatesGroup = &metav1.APIResourceList{
+		GroupVersion: "certificates.k8s.io/v1beta1",
+		APIResources: []metav1.APIResource{certificateSigningRequestsResource},
+	}
+
+	certificateSigningRequestsResource = metav1.APIResource{
 		Name:         "certificatesigningrequests",
 		SingularName: "certificatesigningrequest",
 		Namespaced:   false,
@@ -297,791 +313,315 @@ func TestBackupMethod(t *testing.T) {
 		ShortNames:   []string{"csr"},
 	}
 
-	discoveryHelper := &fakeDiscoveryHelper{
-		mapper: &FakeMapper{
-			Resources: map[schema.GroupVersionResource]schema.GroupVersionResource{
-				schema.GroupVersionResource{Resource: "cm"}:    schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
-				schema.GroupVersionResource{Resource: "csr"}:   schema.GroupVersionResource{Group: "certificates.k8s.io", Version: "v1beta1", Resource: "certificatesigningrequests"},
-				schema.GroupVersionResource{Resource: "roles"}: schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1beta1", Resource: "roles"},
-			},
-		},
-		resources: []*metav1.APIResourceList{
-			{
-				GroupVersion: "v1",
-				APIResources: []metav1.APIResource{configMapsResource, podsResource},
-			},
-			{
-				GroupVersion: "certificates.k8s.io/v1beta1",
-				APIResources: []metav1.APIResource{certificateSigningRequestsResource},
-			},
-			{
-				GroupVersion: "rbac.authorization.k8s.io/v1beta1",
-				APIResources: []metav1.APIResource{rolesResource},
-			},
-		},
+	extensionsGroup = &metav1.APIResourceList{
+		GroupVersion: "extensions/v1beta1",
+		APIResources: []metav1.APIResource{deploymentsResource, networkPoliciesResource},
 	}
 
-	dynamicFactory := &FakeDynamicFactory{}
-
-	legacyGV := schema.GroupVersionResource{Version: "v1"}
-
-	configMapsClientA := &FakeDynamicClient{}
-	configMapsA := toRuntimeObject(t, `{
-		"apiVersion": "v1",
-		"kind": "ConfigMapList",
-		"items": [
-		  {
-		  	"metadata": {
-		  		"namespace":"a",
-					"name":"configMap1"
-				},
-				"data": {
-					"a": "b"
-				}
-			}
-		]
-	}`)
-	configMapsClientA.On("List", metav1.ListOptions{}).Return(configMapsA, nil)
-	dynamicFactory.On("ClientForGroupVersionResource", legacyGV, configMapsResource, "a").Return(configMapsClientA, nil)
-
-	configMapsClientB := &FakeDynamicClient{}
-	configMapsB := toRuntimeObject(t, `{
-		"apiVersion": "v1",
-		"kind": "ConfigMapList",
-		"items": [
-		  {
-		  	"metadata": {
-		  		"namespace":"b",
-					"name":"configMap2"
-				},
-				"data": {
-					"c": "d"
-				}
-			}
-		]
-	}`)
-	configMapsClientB.On("List", metav1.ListOptions{}).Return(configMapsB, nil)
-	dynamicFactory.On("ClientForGroupVersionResource", legacyGV, configMapsResource, "b").Return(configMapsClientB, nil)
-
-	certificatesGV := schema.GroupVersionResource{Group: "certificates.k8s.io", Version: "v1beta1"}
-
-	csrList := toRuntimeObject(t, `{
-		"apiVersion": "certificates.k8s.io/v1beta1",
-		"kind": "CertificateSigningRequestList",
-		"items": [
-			{
-				"metadata": {
-					"name": "csr1"
-				},
-				"spec": {
-					"request": "some request",
-					"username": "bob",
-					"uid": "12345",
-					"groups": [
-						"group1",
-						"group2"
-					]
-				},
-				"status": {
-					"certificate": "some cert"
-				}
-			}
-		]
-	}`)
-	csrClient := &FakeDynamicClient{}
-	csrClient.On("List", metav1.ListOptions{}).Return(csrList, nil)
-	dynamicFactory.On("ClientForGroupVersionResource", certificatesGV, certificateSigningRequestsResource, "").Return(csrClient, nil)
-
-	roleListA := toRuntimeObject(t, `{
-		"apiVersion": "rbac.authorization.k8s.io/v1beta1",
-		"kind": "RoleList",
-		"items": [
-			{
-				"metadata": {
-					"namespace": "a",
-					"name": "role1"
-				},
-				"rules": [
-					{
-						"verbs": ["get","list"],
-						"apiGroups": ["apps","extensions"],
-						"resources": ["deployments"]
-					}
-				]
-			}
-		]
-	}`)
-
-	roleListB := toRuntimeObject(t, `{
-		"apiVersion": "rbac.authorization.k8s.io/v1beta1",
-		"kind": "RoleList",
-		"items": []
-	}`)
-
-	rbacGV := schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1beta1"}
-
-	rolesClientA := &FakeDynamicClient{}
-	rolesClientA.On("List", metav1.ListOptions{}).Return(roleListA, nil)
-	dynamicFactory.On("ClientForGroupVersionResource", rbacGV, rolesResource, "a").Return(rolesClientA, nil)
-	rolesClientB := &FakeDynamicClient{}
-	rolesClientB.On("List", metav1.ListOptions{}).Return(roleListB, nil)
-	dynamicFactory.On("ClientForGroupVersionResource", rbacGV, rolesResource, "b").Return(rolesClientB, nil)
-
-	cmAction := &fakeAction{}
-	csrAction := &fakeAction{}
-
-	actions := map[string]Action{
-		"cm":  cmAction,
-		"csr": csrAction,
+	extensionsGroupVersion = schema.GroupVersion{
+		Group:   "extensions",
+		Version: "v1beta1",
 	}
 
-	backupper, err := NewKubernetesBackupper(discoveryHelper, dynamicFactory, actions)
-	require.NoError(t, err)
-
-	output := new(bytes.Buffer)
-	err = backupper.Backup(backup, output)
-	require.NoError(t, err)
-
-	expectedFiles := sets.NewString(
-		"namespaces/a/configmaps/configMap1.json",
-		"namespaces/b/configmaps/configMap2.json",
-		"cluster/certificatesigningrequests.certificates.k8s.io/csr1.json",
-		"namespaces/a/roles.rbac.authorization.k8s.io/role1.json",
-	)
-
-	expectedData := map[string]string{
-		"namespaces/a/configmaps/configMap1.json": `
-			{
-				"apiVersion": "v1",
-				"kind": "ConfigMap",
-				"metadata": {
-					"namespace":"a",
-					"name":"configMap1"
-				},
-				"data": {
-					"a": "b"
-				}
-			}`,
-		"namespaces/b/configmaps/configMap2.json": `
-			{
-				"apiVersion": "v1",
-				"kind": "ConfigMap",
-				"metadata": {
-					"namespace":"b",
-					"name":"configMap2"
-				},
-				"data": {
-					"c": "d"
-				}
-			}
-		`,
-		"cluster/certificatesigningrequests.certificates.k8s.io/csr1.json": `
-			{
-				"apiVersion": "certificates.k8s.io/v1beta1",
-				"kind": "CertificateSigningRequest",
-				"metadata": {
-					"name": "csr1"
-				},
-				"spec": {
-					"request": "some request",
-					"username": "bob",
-					"uid": "12345",
-					"groups": [
-						"group1",
-						"group2"
-					]
-				}
-			}
-		`,
-		"namespaces/a/roles.rbac.authorization.k8s.io/role1.json": `
-			{
-				"apiVersion": "rbac.authorization.k8s.io/v1beta1",
-				"kind": "Role",
-				"metadata": {
-					"namespace":"a",
-					"name": "role1"
-				},
-				"rules": [
-					{
-						"verbs": ["get","list"],
-						"apiGroups": ["apps","extensions"],
-						"resources": ["deployments"]
-					}
-				]
-			}
-		`,
+	appsGroup = &metav1.APIResourceList{
+		GroupVersion: "apps/v1beta1",
+		APIResources: []metav1.APIResource{deploymentsResource},
 	}
 
-	seenFiles := sets.NewString()
-
-	gzipReader, err := gzip.NewReader(output)
-	require.NoError(t, err)
-	defer gzipReader.Close()
-
-	tarReader := tar.NewReader(gzipReader)
-	for {
-		header, err := tarReader.Next()
-		if err == io.EOF {
-			break
-		}
-		require.NoError(t, err)
-
-		switch header.Typeflag {
-		case tar.TypeReg:
-			seenFiles.Insert(header.Name)
-			expected, err := getAsMap(expectedData[header.Name])
-			if !assert.NoError(t, err, "%q: %v", header.Name, err) {
-				continue
-			}
-
-			buf := new(bytes.Buffer)
-			n, err := io.Copy(buf, tarReader)
-			if !assert.NoError(t, err) {
-				continue
-			}
-
-			if !assert.Equal(t, header.Size, n) {
-				continue
-			}
-
-			actual, err := getAsMap(string(buf.Bytes()))
-			if !assert.NoError(t, err) {
-				continue
-			}
-			assert.Equal(t, expected, actual)
-		default:
-			t.Errorf("unexpected header: %#v", header)
-		}
+	appsGroupVersion = schema.GroupVersion{
+		Group:   "apps",
+		Version: "v1beta1",
 	}
 
-	if !expectedFiles.Equal(seenFiles) {
-		t.Errorf("did not get expected files. expected-seen: %v. seen-expected: %v", expectedFiles.Difference(seenFiles), seenFiles.Difference(expectedFiles))
+	deploymentsResource = metav1.APIResource{
+		Name:         "deployments",
+		SingularName: "deployment",
+		Namespaced:   true,
+		Kind:         "Deployment",
+		Verbs:        metav1.Verbs([]string{"create", "update", "get", "list", "watch", "delete"}),
+		ShortNames:   []string{"deploy"},
+		Categories:   []string{"all"},
 	}
 
-	expectedCMActionIDs := []string{"a/configMap1", "b/configMap2"}
-	expectedCSRActionIDs := []string{"csr1"}
+	networkingGroup = &metav1.APIResourceList{
+		GroupVersion: "networking.k8s.io/v1",
+		APIResources: []metav1.APIResource{networkPoliciesResource},
+	}
 
-	assert.Equal(t, expectedCMActionIDs, cmAction.ids)
-	assert.Equal(t, expectedCSRActionIDs, csrAction.ids)
+	networkingGroupVersion = schema.GroupVersion{
+		Group:   "networking.k8s.io",
+		Version: "v1",
+	}
+
+	networkPoliciesResource = metav1.APIResource{
+		Name:         "networkpolicies",
+		SingularName: "networkpolicy",
+		Namespaced:   true,
+		Kind:         "Deployment",
+		Verbs:        metav1.Verbs([]string{"create", "update", "get", "list", "watch", "delete"}),
+	}
+)
+
+func parseLabelSelectorOrDie(s string) labels.Selector {
+	ret, err := labels.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return ret
 }
 
-func TestBackupResource(t *testing.T) {
+func TestBackup(t *testing.T) {
 	tests := []struct {
-		name                            string
-		resourceIncludesExcludes        *collections.IncludesExcludes
-		resourceGroup                   string
-		resourceVersion                 string
-		resourceGV                      string
-		resourceName                    string
-		resourceNamespaced              bool
-		namespaceIncludesExcludes       *collections.IncludesExcludes
-		expectedListedNamespaces        []string
-		lists                           []string
-		labelSelector                   string
-		actions                         map[string]Action
-		expectedActionIDs               map[string][]string
-		deploymentsBackedUp             bool
-		expectedDeploymentsBackedUp     bool
-		networkPoliciesBackedUp         bool
-		expectedNetworkPoliciesBackedUp bool
+		name                  string
+		backup                *v1.Backup
+		expectedNamespaces    *collections.IncludesExcludes
+		expectedResources     *collections.IncludesExcludes
+		expectedLabelSelector string
+		expectedHooks         []resourceHook
+		backupGroupErrors     map[*metav1.APIResourceList]error
+		expectedError         error
 	}{
 		{
-			name: "should not include resource",
-			resourceIncludesExcludes: collections.NewIncludesExcludes().Includes("pods"),
-			resourceGV:               "v1",
-			resourceName:             "secrets",
-			resourceNamespaced:       true,
-		},
-		{
-			name: "should skip deployments.extensions if we've seen deployments.apps",
-			resourceIncludesExcludes:    collections.NewIncludesExcludes().Includes("*"),
-			resourceGV:                  "extensions/v1beta1",
-			resourceName:                "deployments",
-			resourceNamespaced:          true,
-			deploymentsBackedUp:         true,
-			expectedDeploymentsBackedUp: true,
-		},
-		{
-			name: "should skip deployments.apps if we've seen deployments.extensions",
-			resourceIncludesExcludes:    collections.NewIncludesExcludes().Includes("*"),
-			resourceGV:                  "apps/v1beta1",
-			resourceName:                "deployments",
-			resourceNamespaced:          true,
-			deploymentsBackedUp:         true,
-			expectedDeploymentsBackedUp: true,
-		},
-		{
-			name: "should skip networkpolicies.extensions if we've seen networkpolicies.networking.k8s.io",
-			resourceIncludesExcludes:        collections.NewIncludesExcludes().Includes("*"),
-			resourceGV:                      "extensions/v1beta1",
-			resourceName:                    "networkpolicies",
-			resourceNamespaced:              true,
-			networkPoliciesBackedUp:         true,
-			expectedNetworkPoliciesBackedUp: true,
-		},
-		{
-			name: "should skip networkpolicies.networking.k8s.io if we've seen networkpolicies.extensions",
-			resourceIncludesExcludes:        collections.NewIncludesExcludes().Includes("*"),
-			resourceGV:                      "networking.k8s.io/v1",
-			resourceName:                    "networkpolicies",
-			resourceNamespaced:              true,
-			networkPoliciesBackedUp:         true,
-			expectedNetworkPoliciesBackedUp: true,
-		},
-		{
-			name: "list per namespace when not including *",
-			resourceIncludesExcludes:  collections.NewIncludesExcludes().Includes("*"),
-			resourceGroup:             "apps",
-			resourceVersion:           "v1beta1",
-			resourceGV:                "apps/v1beta1",
-			resourceName:              "deployments",
-			resourceNamespaced:        true,
-			namespaceIncludesExcludes: collections.NewIncludesExcludes().Includes("a", "b"),
-			expectedListedNamespaces:  []string{"a", "b"},
-			lists: []string{
-				`{
-	"apiVersion": "apps/v1beta1",
-	"kind": "DeploymentList",
-	"items": [
-		{
-			"metadata": {
-				"namespace": "a",
-				"name": "1"
-			}
-		}
-	]
-}`,
-				`{
-	"apiVersion": "apps/v1beta1v1",
-	"kind": "DeploymentList",
-	"items": [
-		{
-			"metadata": {
-				"namespace": "b",
-				"name": "2"
-			}
-		}
-	]
-}`,
+			name: "happy path, no actions, no label selector, no hooks, no errors",
+			backup: &v1.Backup{
+				Spec: v1.BackupSpec{
+					// cm - shortcut in legacy api group
+					// csr - shortcut in certificates.k8s.io api group
+					// roles - fully qualified in rbac.authorization.k8s.io api group
+					IncludedResources:  []string{"cm", "csr", "roles"},
+					IncludedNamespaces: []string{"a", "b"},
+					ExcludedNamespaces: []string{"c", "d"},
+				},
 			},
-			expectedDeploymentsBackedUp: true,
-		},
-		{
-			name: "list all namespaces when including *",
-			resourceIncludesExcludes:  collections.NewIncludesExcludes().Includes("*"),
-			resourceGroup:             "networking.k8s.io",
-			resourceVersion:           "v1",
-			resourceGV:                "networking.k8s.io/v1",
-			resourceName:              "networkpolicies",
-			resourceNamespaced:        true,
-			namespaceIncludesExcludes: collections.NewIncludesExcludes().Includes("*"),
-			expectedListedNamespaces:  []string{""},
-			lists: []string{
-				`{
-	"apiVersion": "networking.k8s.io/v1",
-	"kind": "NetworkPolicyList",
-	"items": [
-		{
-			"metadata": {
-				"namespace": "a",
-				"name": "1"
-			}
-		}
-	]
-}`,
-			},
-			expectedNetworkPoliciesBackedUp: true,
-		},
-		{
-			name: "list all namespaces when cluster-scoped, even with namespace includes",
-			resourceIncludesExcludes:  collections.NewIncludesExcludes().Includes("*"),
-			resourceGroup:             "certificates.k8s.io",
-			resourceVersion:           "v1beta1",
-			resourceGV:                "certificates.k8s.io/v1beta1",
-			resourceName:              "certificatesigningrequests",
-			resourceNamespaced:        false,
-			namespaceIncludesExcludes: collections.NewIncludesExcludes().Includes("a"),
-			expectedListedNamespaces:  []string{""},
-			labelSelector:             "a=b",
-			lists: []string{
-				`{
-	"apiVersion": "certifiaces.k8s.io/v1beta1",
-	"kind": "CertificateSigningRequestList",
-	"items": [
-		{
-			"metadata": {
-				"name": "1",
-				"labels": {
-					"a": "b"
-				}
-			}
-		}
-	]
-}`,
+			expectedNamespaces: collections.NewIncludesExcludes().Includes("a", "b").Excludes("c", "d"),
+			expectedResources:  collections.NewIncludesExcludes().Includes("configmaps", "certificatesigningrequests.certificates.k8s.io", "roles.rbac.authorization.k8s.io"),
+			expectedHooks:      []resourceHook{},
+			backupGroupErrors: map[*metav1.APIResourceList]error{
+				v1Group:           nil,
+				certificatesGroup: nil,
+				rbacGroup:         nil,
 			},
 		},
 		{
-			name: "use a custom action",
-			resourceIncludesExcludes:  collections.NewIncludesExcludes().Includes("*"),
-			resourceGroup:             "certificates.k8s.io",
-			resourceVersion:           "v1beta1",
-			resourceGV:                "certificates.k8s.io/v1beta1",
-			resourceName:              "certificatesigningrequests",
-			resourceNamespaced:        false,
-			namespaceIncludesExcludes: collections.NewIncludesExcludes().Includes("a"),
-			expectedListedNamespaces:  []string{""},
-			labelSelector:             "a=b",
-			lists: []string{
-				`{
-	"apiVersion": "certifiaces.k8s.io/v1beta1",
-	"kind": "CertificateSigningRequestList",
-	"items": [
+			name: "label selector",
+			backup: &v1.Backup{
+				Spec: v1.BackupSpec{
+					LabelSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"a": "b"},
+					},
+				},
+			},
+			expectedNamespaces:    collections.NewIncludesExcludes(),
+			expectedResources:     collections.NewIncludesExcludes(),
+			expectedHooks:         []resourceHook{},
+			expectedLabelSelector: "a=b",
+			backupGroupErrors: map[*metav1.APIResourceList]error{
+				v1Group:           nil,
+				certificatesGroup: nil,
+				rbacGroup:         nil,
+			},
+		},
 		{
-			"metadata": {
-				"name": "1",
-				"labels": {
-					"a": "b"
-				}
-			}
-		}
-	]
-}`,
+			name:               "backupGroup errors",
+			backup:             &v1.Backup{},
+			expectedNamespaces: collections.NewIncludesExcludes(),
+			expectedResources:  collections.NewIncludesExcludes(),
+			expectedHooks:      []resourceHook{},
+			backupGroupErrors: map[*metav1.APIResourceList]error{
+				v1Group:           errors.New("v1 error"),
+				certificatesGroup: nil,
+				rbacGroup:         errors.New("rbac error"),
 			},
-			actions: map[string]Action{
-				"certificatesigningrequests": &fakeAction{},
-				"other": &fakeAction{},
+			expectedError: errors.New("[v1 error, rbac error]"),
+		},
+		{
+			name: "hooks",
+			backup: &v1.Backup{
+				Spec: v1.BackupSpec{
+					Hooks: v1.BackupHooks{
+						Resources: []v1.BackupResourceHookSpec{
+							{
+								Name:               "hook1",
+								IncludedNamespaces: []string{"a"},
+								ExcludedNamespaces: []string{"b"},
+								IncludedResources:  []string{"cm"},
+								ExcludedResources:  []string{"roles"},
+								LabelSelector: &metav1.LabelSelector{
+									MatchLabels: map[string]string{"1": "2"},
+								},
+								Hooks: []v1.BackupResourceHook{
+									{
+										Exec: &v1.ExecHook{
+											Command: []string{"ls", "/tmp"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
 			},
-			expectedActionIDs: map[string][]string{
-				"certificatesigningrequests": {"1"},
+			expectedNamespaces: collections.NewIncludesExcludes(),
+			expectedResources:  collections.NewIncludesExcludes(),
+			expectedHooks: []resourceHook{
+				{
+					name:          "hook1",
+					namespaces:    collections.NewIncludesExcludes().Includes("a").Excludes("b"),
+					resources:     collections.NewIncludesExcludes().Includes("configmaps").Excludes("roles.rbac.authorization.k8s.io"),
+					labelSelector: parseLabelSelectorOrDie("1=2"),
+					pre: []v1.BackupResourceHook{
+						{
+							Exec: &v1.ExecHook{
+								Command: []string{"ls", "/tmp"},
+							},
+						},
+					},
+				},
+			},
+			backupGroupErrors: map[*metav1.APIResourceList]error{
+				v1Group:           nil,
+				certificatesGroup: nil,
+				rbacGroup:         nil,
 			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			var labelSelector *metav1.LabelSelector
-			if test.labelSelector != "" {
-				s, err := metav1.ParseToLabelSelector(test.labelSelector)
-				require.NoError(t, err)
-				labelSelector = s
-			}
-			ctx := &backupContext{
-				backup: &v1.Backup{
-					Spec: v1.BackupSpec{
-						LabelSelector: labelSelector,
-					},
-				},
-				resourceIncludesExcludes:  test.resourceIncludesExcludes,
-				namespaceIncludesExcludes: test.namespaceIncludesExcludes,
-				deploymentsBackedUp:       test.deploymentsBackedUp,
-				networkPoliciesBackedUp:   test.networkPoliciesBackedUp,
-			}
-
-			group := &metav1.APIResourceList{
-				GroupVersion: test.resourceGV,
-			}
-
-			resource := metav1.APIResource{Name: test.resourceName, Namespaced: test.resourceNamespaced}
-
-			itemBackupper := &fakeItemBackupper{}
-
-			var actualActionIDs map[string][]string
-
-			dynamicFactory := &FakeDynamicFactory{}
-			gvr := schema.GroupVersionResource{Group: test.resourceGroup, Version: test.resourceVersion}
-			gr := schema.GroupResource{Group: test.resourceGroup, Resource: test.resourceName}
-			for i, namespace := range test.expectedListedNamespaces {
-				obj := toRuntimeObject(t, test.lists[i])
-
-				client := &FakeDynamicClient{}
-				client.On("List", metav1.ListOptions{LabelSelector: test.labelSelector}).Return(obj, nil)
-				dynamicFactory.On("ClientForGroupVersionResource", gvr, resource, namespace).Return(client, nil)
-
-				action := test.actions[test.resourceName]
-
-				list, err := meta.ExtractList(obj)
-				require.NoError(t, err)
-				for i := range list {
-					item := list[i].(*unstructured.Unstructured)
-					itemBackupper.On("backupItem", ctx, item.Object, gr.String(), action).Return(nil)
-					if action != nil {
-						a, err := meta.Accessor(item)
-						require.NoError(t, err)
-						ns := a.GetNamespace()
-						name := a.GetName()
-						id := ns
-						if id != "" {
-							id += "/"
-						}
-						id += name
-						if actualActionIDs == nil {
-							actualActionIDs = make(map[string][]string)
-						}
-						actualActionIDs[test.resourceName] = append(actualActionIDs[test.resourceName], id)
-					}
-				}
-			}
-
-			discoveryHelper := &fakeDiscoveryHelper{
-				mapper: &FakeMapper{
+			discoveryHelper := &arktest.FakeDiscoveryHelper{
+				Mapper: &arktest.FakeMapper{
 					Resources: map[schema.GroupVersionResource]schema.GroupVersionResource{
-						schema.GroupVersionResource{Resource: "certificatesigningrequests"}: schema.GroupVersionResource{Group: "certificates.k8s.io", Version: "v1beta1", Resource: "certificatesigningrequests"},
-						schema.GroupVersionResource{Resource: "other"}:                      schema.GroupVersionResource{Group: "somegroup", Version: "someversion", Resource: "otherthings"},
+						{Resource: "cm"}:    {Group: "", Version: "v1", Resource: "configmaps"},
+						{Resource: "csr"}:   {Group: "certificates.k8s.io", Version: "v1beta1", Resource: "certificatesigningrequests"},
+						{Resource: "roles"}: {Group: "rbac.authorization.k8s.io", Version: "v1beta1", Resource: "roles"},
 					},
+				},
+				ResourceList: []*metav1.APIResourceList{
+					v1Group,
+					certificatesGroup,
+					rbacGroup,
 				},
 			}
 
-			kb, err := NewKubernetesBackupper(discoveryHelper, dynamicFactory, test.actions)
+			dynamicFactory := &arktest.FakeDynamicFactory{}
+
+			podCommandExecutor := &mockPodCommandExecutor{}
+			defer podCommandExecutor.AssertExpectations(t)
+
+			b, err := NewKubernetesBackupper(
+				discoveryHelper,
+				dynamicFactory,
+				podCommandExecutor,
+				nil,
+			)
 			require.NoError(t, err)
-			backupper := kb.(*kubernetesBackupper)
-			backupper.itemBackupper = itemBackupper
+			kb := b.(*kubernetesBackupper)
 
-			err = backupper.backupResource(ctx, group, resource)
+			groupBackupperFactory := &mockGroupBackupperFactory{}
+			defer groupBackupperFactory.AssertExpectations(t)
+			kb.groupBackupperFactory = groupBackupperFactory
 
-			assert.Equal(t, test.expectedDeploymentsBackedUp, ctx.deploymentsBackedUp)
-			assert.Equal(t, test.expectedNetworkPoliciesBackedUp, ctx.networkPoliciesBackedUp)
-			assert.Equal(t, test.expectedActionIDs, actualActionIDs)
+			groupBackupper := &mockGroupBackupper{}
+			defer groupBackupper.AssertExpectations(t)
+
+			cohabitatingResources := map[string]*cohabitatingResource{
+				"deployments":     newCohabitatingResource("deployments", "extensions", "apps"),
+				"networkpolicies": newCohabitatingResource("networkpolicies", "extensions", "networking.k8s.io"),
+				"events":          newCohabitatingResource("events", "", "events.k8s.io"),
+			}
+
+			groupBackupperFactory.On("newGroupBackupper",
+				mock.Anything, // log
+				test.backup,
+				test.expectedNamespaces,
+				test.expectedResources,
+				test.expectedLabelSelector,
+				dynamicFactory,
+				discoveryHelper,
+				map[itemKey]struct{}{}, // backedUpItems
+				cohabitatingResources,
+				mock.Anything,
+				kb.podCommandExecutor,
+				mock.Anything, // tarWriter
+				test.expectedHooks,
+				mock.Anything,
+			).Return(groupBackupper)
+
+			for group, err := range test.backupGroupErrors {
+				groupBackupper.On("backupGroup", group).Return(err)
+			}
+
+			var backupFile, logFile bytes.Buffer
+
+			err = b.Backup(test.backup, &backupFile, &logFile, nil)
+			defer func() {
+				// print log if anything failed
+				if t.Failed() {
+					gzr, err := gzip.NewReader(&logFile)
+					require.NoError(t, err)
+					t.Log("Backup log contents:")
+					var buf bytes.Buffer
+					_, err = io.Copy(&buf, gzr)
+					require.NoError(t, err)
+					require.NoError(t, gzr.Close())
+					t.Log(buf.String())
+				}
+			}()
+
+			if test.expectedError != nil {
+				assert.EqualError(t, err, test.expectedError.Error())
+				return
+			}
+			assert.NoError(t, err)
 		})
 	}
 }
 
-type fakeItemBackupper struct {
+type mockGroupBackupperFactory struct {
 	mock.Mock
 }
 
-func (f *fakeItemBackupper) backupItem(ctx *backupContext, obj map[string]interface{}, groupResource string, action Action) error {
-	args := f.Called(ctx, obj, groupResource, action)
+func (f *mockGroupBackupperFactory) newGroupBackupper(
+	log logrus.FieldLogger,
+	backup *v1.Backup,
+	namespaces, resources *collections.IncludesExcludes,
+	labelSelector string,
+	dynamicFactory client.DynamicFactory,
+	discoveryHelper discovery.Helper,
+	backedUpItems map[itemKey]struct{},
+	cohabitatingResources map[string]*cohabitatingResource,
+	actions []resolvedAction,
+	podCommandExecutor podCommandExecutor,
+	tarWriter tarWriter,
+	resourceHooks []resourceHook,
+	snapshotService cloudprovider.SnapshotService,
+) groupBackupper {
+	args := f.Called(
+		log,
+		backup,
+		namespaces,
+		resources,
+		labelSelector,
+		dynamicFactory,
+		discoveryHelper,
+		backedUpItems,
+		cohabitatingResources,
+		actions,
+		podCommandExecutor,
+		tarWriter,
+		resourceHooks,
+		snapshotService,
+	)
+	return args.Get(0).(groupBackupper)
+}
+
+type mockGroupBackupper struct {
+	mock.Mock
+}
+
+func (gb *mockGroupBackupper) backupGroup(group *metav1.APIResourceList) error {
+	args := gb.Called(group)
 	return args.Error(0)
-}
-
-type fakeTarWriter struct {
-	closeCalled      bool
-	headers          []*tar.Header
-	data             [][]byte
-	writeHeaderError error
-	writeError       error
-}
-
-func (w *fakeTarWriter) Close() error { return nil }
-
-func (w *fakeTarWriter) Write(data []byte) (int, error) {
-	w.data = append(w.data, data)
-	return 0, w.writeError
-}
-
-func (w *fakeTarWriter) WriteHeader(header *tar.Header) error {
-	w.headers = append(w.headers, header)
-	return w.writeHeaderError
-}
-
-func TestBackupItem(t *testing.T) {
-	tests := []struct {
-		name                      string
-		item                      string
-		namespaceIncludesExcludes *collections.IncludesExcludes
-		expectError               bool
-		expectExcluded            bool
-		expectedTarHeaderName     string
-		tarWriteError             bool
-		tarHeaderWriteError       bool
-		customAction              bool
-		expectedActionID          string
-	}{
-		{
-			name:        "empty map",
-			item:        "{}",
-			expectError: true,
-		},
-		{
-			name:        "missing name",
-			item:        `{"metadata":{}}`,
-			expectError: true,
-		},
-		{
-			name: "excluded by namespace",
-			item: `{"metadata":{"namespace":"foo","name":"bar"}}`,
-			namespaceIncludesExcludes: collections.NewIncludesExcludes().Includes("*").Excludes("foo"),
-			expectError:               false,
-			expectExcluded:            true,
-		},
-		{
-			name: "explicit namespace include",
-			item: `{"metadata":{"namespace":"foo","name":"bar"}}`,
-			namespaceIncludesExcludes: collections.NewIncludesExcludes().Includes("foo"),
-			expectError:               false,
-			expectExcluded:            false,
-			expectedTarHeaderName:     "namespaces/foo/resource.group/bar.json",
-		},
-		{
-			name: "* namespace include",
-			item: `{"metadata":{"namespace":"foo","name":"bar"}}`,
-			namespaceIncludesExcludes: collections.NewIncludesExcludes().Includes("*"),
-			expectError:               false,
-			expectExcluded:            false,
-			expectedTarHeaderName:     "namespaces/foo/resource.group/bar.json",
-		},
-		{
-			name:                  "cluster-scoped",
-			item:                  `{"metadata":{"name":"bar"}}`,
-			expectError:           false,
-			expectExcluded:        false,
-			expectedTarHeaderName: "cluster/resource.group/bar.json",
-		},
-		{
-			name:                  "make sure status is deleted",
-			item:                  `{"metadata":{"name":"bar"},"spec":{"color":"green"},"status":{"foo":"bar"}}`,
-			expectError:           false,
-			expectExcluded:        false,
-			expectedTarHeaderName: "cluster/resource.group/bar.json",
-		},
-		{
-			name:                "tar header write error",
-			item:                `{"metadata":{"name":"bar"},"spec":{"color":"green"},"status":{"foo":"bar"}}`,
-			expectError:         true,
-			tarHeaderWriteError: true,
-		},
-		{
-			name:          "tar write error",
-			item:          `{"metadata":{"name":"bar"},"spec":{"color":"green"},"status":{"foo":"bar"}}`,
-			expectError:   true,
-			tarWriteError: true,
-		},
-		{
-			name: "action invoked - cluster-scoped",
-			namespaceIncludesExcludes: collections.NewIncludesExcludes().Includes("*"),
-			item:                  `{"metadata":{"name":"bar"}}`,
-			expectError:           false,
-			expectExcluded:        false,
-			expectedTarHeaderName: "cluster/resource.group/bar.json",
-			customAction:          true,
-			expectedActionID:      "bar",
-		},
-		{
-			name: "action invoked - namespaced",
-			namespaceIncludesExcludes: collections.NewIncludesExcludes().Includes("*"),
-			item:                  `{"metadata":{"namespace": "myns", "name":"bar"}}`,
-			expectError:           false,
-			expectExcluded:        false,
-			expectedTarHeaderName: "namespaces/myns/resource.group/bar.json",
-			customAction:          true,
-			expectedActionID:      "myns/bar",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			item, err := getAsMap(test.item)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			namespaces := test.namespaceIncludesExcludes
-			if namespaces == nil {
-				namespaces = collections.NewIncludesExcludes()
-			}
-
-			w := &fakeTarWriter{}
-			if test.tarHeaderWriteError {
-				w.writeHeaderError = errors.New("error")
-			}
-			if test.tarWriteError {
-				w.writeError = errors.New("error")
-			}
-
-			var (
-				actionParam Action
-				action      *fakeAction
-				backup      *v1.Backup
-			)
-			if test.customAction {
-				action = &fakeAction{}
-				actionParam = action
-				backup = &v1.Backup{}
-			}
-			ctx := &backupContext{
-				backup: backup,
-				namespaceIncludesExcludes: namespaces,
-				w: w,
-			}
-			b := &realItemBackupper{}
-			err = b.backupItem(ctx, item, "resource.group", actionParam)
-			gotError := err != nil
-			if e, a := test.expectError, gotError; e != a {
-				t.Fatalf("error: expected %t, got %t", e, a)
-			}
-			if test.expectError {
-				return
-			}
-
-			if test.expectExcluded {
-				if len(w.headers) > 0 {
-					t.Errorf("unexpected header write")
-				}
-				if len(w.data) > 0 {
-					t.Errorf("unexpected data write")
-				}
-				return
-			}
-
-			// we have to delete status as that's what backupItem does,
-			// and this ensures that we're verifying the right data
-			delete(item, "status")
-			itemWithoutStatus, err := json.Marshal(&item)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if e, a := 1, len(w.headers); e != a {
-				t.Errorf("headers: expected %d, got %d", e, a)
-			}
-
-			if e, a := test.expectedTarHeaderName, w.headers[0].Name; e != a {
-				t.Errorf("header.name: expected %s, got %s", e, a)
-			}
-
-			if e, a := int64(len(itemWithoutStatus)), w.headers[0].Size; e != a {
-				t.Errorf("header.size: expected %d, got %d", e, a)
-			}
-
-			if e, a := byte(tar.TypeReg), w.headers[0].Typeflag; e != a {
-				t.Errorf("header.typeflag: expected %v, got %v", e, a)
-			}
-
-			if e, a := int64(0755), w.headers[0].Mode; e != a {
-				t.Errorf("header.mode: expected %d, got %d", e, a)
-			}
-
-			if w.headers[0].ModTime.IsZero() {
-				t.Errorf("header.modTime: expected it to be set")
-			}
-
-			if e, a := 1, len(w.data); e != a {
-				t.Errorf("# of data: expected %d, got %d", e, a)
-			}
-
-			actual, err := getAsMap(string(w.data[0]))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if e, a := item, actual; !reflect.DeepEqual(e, a) {
-				t.Errorf("data: expected %s, got %s", e, a)
-			}
-
-			if test.customAction {
-				if len(action.ids) != 1 {
-					t.Errorf("unexpected custom action ids: %v", action.ids)
-				} else if e, a := test.expectedActionID, action.ids[0]; e != a {
-					t.Errorf("action.ids[0]: expected %s, got %s", e, a)
-				}
-
-				if len(action.backups) != 1 {
-					t.Errorf("unexpected custom action backups: %#v", action.backups)
-				} else if e, a := backup, action.backups[0]; e != a {
-					t.Errorf("action.backups[0]: expected %#v, got %#v", e, a)
-				}
-			}
-		})
-	}
 }
 
 func getAsMap(j string) (map[string]interface{}, error) {
@@ -1094,4 +634,146 @@ func toRuntimeObject(t *testing.T, data string) runtime.Object {
 	o, _, err := unstructured.UnstructuredJSONScheme.Decode([]byte(data), nil, nil)
 	require.NoError(t, err)
 	return o
+}
+
+func unstructuredOrDie(data string) *unstructured.Unstructured {
+	o, _, err := unstructured.UnstructuredJSONScheme.Decode([]byte(data), nil, nil)
+	if err != nil {
+		panic(err)
+	}
+	return o.(*unstructured.Unstructured)
+}
+
+func TestGetResourceHook(t *testing.T) {
+	tests := []struct {
+		name     string
+		hookSpec v1.BackupResourceHookSpec
+		expected resourceHook
+	}{
+		{
+			name: "PreHooks take priority over Hooks",
+			hookSpec: v1.BackupResourceHookSpec{
+				Name: "spec1",
+				PreHooks: []v1.BackupResourceHook{
+					{
+						Exec: &v1.ExecHook{
+							Container: "a",
+							Command:   []string{"b"},
+						},
+					},
+				},
+				Hooks: []v1.BackupResourceHook{
+					{
+						Exec: &v1.ExecHook{
+							Container: "c",
+							Command:   []string{"d"},
+						},
+					},
+				},
+			},
+			expected: resourceHook{
+				name:       "spec1",
+				namespaces: collections.NewIncludesExcludes(),
+				resources:  collections.NewIncludesExcludes(),
+				pre: []v1.BackupResourceHook{
+					{
+						Exec: &v1.ExecHook{
+							Container: "a",
+							Command:   []string{"b"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Use Hooks if PreHooks isn't set",
+			hookSpec: v1.BackupResourceHookSpec{
+				Name: "spec1",
+				Hooks: []v1.BackupResourceHook{
+					{
+						Exec: &v1.ExecHook{
+							Container: "a",
+							Command:   []string{"b"},
+						},
+					},
+				},
+			},
+			expected: resourceHook{
+				name:       "spec1",
+				namespaces: collections.NewIncludesExcludes(),
+				resources:  collections.NewIncludesExcludes(),
+				pre: []v1.BackupResourceHook{
+					{
+						Exec: &v1.ExecHook{
+							Container: "a",
+							Command:   []string{"b"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Full test",
+			hookSpec: v1.BackupResourceHookSpec{
+				Name:               "spec1",
+				IncludedNamespaces: []string{"ns1", "ns2"},
+				ExcludedNamespaces: []string{"ns3", "ns4"},
+				IncludedResources:  []string{"foo", "fie"},
+				ExcludedResources:  []string{"bar", "baz"},
+				PreHooks: []v1.BackupResourceHook{
+					{
+						Exec: &v1.ExecHook{
+							Container: "a",
+							Command:   []string{"b"},
+						},
+					},
+				},
+				PostHooks: []v1.BackupResourceHook{
+					{
+						Exec: &v1.ExecHook{
+							Container: "c",
+							Command:   []string{"d"},
+						},
+					},
+				},
+			},
+			expected: resourceHook{
+				name:       "spec1",
+				namespaces: collections.NewIncludesExcludes().Includes("ns1", "ns2").Excludes("ns3", "ns4"),
+				resources:  collections.NewIncludesExcludes().Includes("foodies.somegroup", "fields.somegroup").Excludes("barnacles.anothergroup", "bazaars.anothergroup"),
+				pre: []v1.BackupResourceHook{
+					{
+						Exec: &v1.ExecHook{
+							Container: "a",
+							Command:   []string{"b"},
+						},
+					},
+				},
+				post: []v1.BackupResourceHook{
+					{
+						Exec: &v1.ExecHook{
+							Container: "c",
+							Command:   []string{"d"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resources := map[schema.GroupVersionResource]schema.GroupVersionResource{
+				{Resource: "foo"}: {Group: "somegroup", Resource: "foodies"},
+				{Resource: "fie"}: {Group: "somegroup", Resource: "fields"},
+				{Resource: "bar"}: {Group: "anothergroup", Resource: "barnacles"},
+				{Resource: "baz"}: {Group: "anothergroup", Resource: "bazaars"},
+			}
+			discoveryHelper := arktest.NewFakeDiscoveryHelper(false, resources)
+
+			actual, err := getResourceHook(test.hookSpec, discoveryHelper)
+			require.NoError(t, err)
+			assert.Equal(t, test.expected, actual)
+		})
+	}
 }

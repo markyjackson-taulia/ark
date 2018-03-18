@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,14 +22,13 @@ import (
 
 	"github.com/spf13/cobra"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
 	"github.com/heptio/ark/pkg/client"
 	"github.com/heptio/ark/pkg/cmd"
 )
 
-func NewDeleteCommand(f client.Factory) *cobra.Command {
+func NewDeleteCommand(f client.Factory, use string) *cobra.Command {
 	c := &cobra.Command{
-		Use:   "delete NAME",
+		Use:   fmt.Sprintf("%s NAME", use),
 		Short: "Delete a restore",
 		Run: func(c *cobra.Command, args []string) {
 			if len(args) != 1 {
@@ -42,7 +41,7 @@ func NewDeleteCommand(f client.Factory) *cobra.Command {
 
 			name := args[0]
 
-			err = arkClient.ArkV1().Restores(api.DefaultNamespace).Delete(name, nil)
+			err = arkClient.ArkV1().Restores(f.Namespace()).Delete(name, nil)
 			cmd.CheckError(err)
 
 			fmt.Printf("Restore %q deleted\n", name)

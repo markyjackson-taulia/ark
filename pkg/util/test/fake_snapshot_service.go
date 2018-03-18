@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package test
 import (
 	"errors"
 
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
@@ -33,13 +34,12 @@ type FakeSnapshotService struct {
 
 	// VolumeBackupInfo -> VolumeID
 	RestorableVolumes map[api.VolumeBackupInfo]string
+
+	VolumeID    string
+	VolumeIDSet string
 }
 
-func (s *FakeSnapshotService) GetAllSnapshots() ([]string, error) {
-	return s.SnapshotsTaken.List(), nil
-}
-
-func (s *FakeSnapshotService) CreateSnapshot(volumeID string) (string, error) {
+func (s *FakeSnapshotService) CreateSnapshot(volumeID, volumeAZ string, tags map[string]string) (string, error) {
 	if _, exists := s.SnapshottableVolumes[volumeID]; !exists {
 		return "", errors.New("snapshottable volume not found")
 	}
@@ -52,11 +52,12 @@ func (s *FakeSnapshotService) CreateSnapshot(volumeID string) (string, error) {
 	return s.SnapshottableVolumes[volumeID].SnapshotID, nil
 }
 
-func (s *FakeSnapshotService) CreateVolumeFromSnapshot(snapshotID, volumeType string, iops *int) (string, error) {
+func (s *FakeSnapshotService) CreateVolumeFromSnapshot(snapshotID, volumeType, volumeAZ string, iops *int64) (string, error) {
 	key := api.VolumeBackupInfo{
-		SnapshotID: snapshotID,
-		Type:       volumeType,
-		Iops:       iops,
+		SnapshotID:       snapshotID,
+		Type:             volumeType,
+		Iops:             iops,
+		AvailabilityZone: volumeAZ,
 	}
 
 	return s.RestorableVolumes[key], nil
@@ -72,10 +73,19 @@ func (s *FakeSnapshotService) DeleteSnapshot(snapshotID string) error {
 	return nil
 }
 
-func (s *FakeSnapshotService) GetVolumeInfo(volumeID string) (string, *int, error) {
+func (s *FakeSnapshotService) GetVolumeInfo(volumeID, volumeAZ string) (string, *int64, error) {
 	if volumeInfo, exists := s.SnapshottableVolumes[volumeID]; !exists {
 		return "", nil, errors.New("VolumeID not found")
 	} else {
 		return volumeInfo.Type, volumeInfo.Iops, nil
 	}
+}
+
+func (s *FakeSnapshotService) GetVolumeID(pv runtime.Unstructured) (string, error) {
+	return s.VolumeID, nil
+}
+
+func (s *FakeSnapshotService) SetVolumeID(pv runtime.Unstructured, volumeID string) (runtime.Unstructured, error) {
+	s.VolumeIDSet = volumeID
+	return pv, nil
 }

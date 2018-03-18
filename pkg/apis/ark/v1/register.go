@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -51,6 +51,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&RestoreList{},
 		&Config{},
 		&ConfigList{},
+		&DownloadRequest{},
+		&DownloadRequestList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil

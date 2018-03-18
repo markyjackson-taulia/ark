@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,302 +17,354 @@ limitations under the License.
 package controller
 
 import (
-	"bytes"
 	"errors"
-	"io"
-	"io/ioutil"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/sets"
+	core "k8s.io/client-go/testing"
 
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/generated/clientset/fake"
+	"github.com/heptio/ark/pkg/generated/clientset/versioned/fake"
 	informers "github.com/heptio/ark/pkg/generated/informers/externalversions"
-	. "github.com/heptio/ark/pkg/util/test"
+	arktest "github.com/heptio/ark/pkg/util/test"
 )
 
-type gcTest struct {
-	name      string
-	bucket    string
-	backups   map[string][]*api.Backup
-	snapshots sets.String
-
-	expectedBackupsRemaining   map[string]sets.String
-	expectedSnapshotsRemaining sets.String
-}
-
-func TestGarbageCollect(t *testing.T) {
+func TestGCControllerRun(t *testing.T) {
 	fakeClock := clock.NewFakeClock(time.Now())
 
-	tests := []gcTest{
-		gcTest{
-			name:   "basic-expired",
-			bucket: "bucket-1",
-			backups: map[string][]*api.Backup{
-				"bucket-1": []*api.Backup{
-					NewTestBackup().WithName("backup-1").
-						WithExpiration(fakeClock.Now().Add(-1*time.Second)).
-						WithSnapshot("pv-1", "snapshot-1").
-						WithSnapshot("pv-2", "snapshot-2").
-						Backup,
-				},
-			},
-			snapshots:                  sets.NewString("snapshot-1", "snapshot-2"),
-			expectedBackupsRemaining:   make(map[string]sets.String),
-			expectedSnapshotsRemaining: sets.NewString(),
+	tests := []struct {
+		name              string
+		backups           []*api.Backup
+		snapshots         sets.String
+		expectedDeletions sets.String
+	}{
+		{
+			name: "no backups results in no deletions",
 		},
-		gcTest{
-			name:   "basic-unexpired",
-			bucket: "bucket-1",
-			backups: map[string][]*api.Backup{
-				"bucket-1": []*api.Backup{
-					NewTestBackup().WithName("backup-1").
-						WithExpiration(fakeClock.Now().Add(1*time.Minute)).
-						WithSnapshot("pv-1", "snapshot-1").
-						WithSnapshot("pv-2", "snapshot-2").
-						Backup,
-				},
+		{
+			name: "expired backup is deleted",
+			backups: []*api.Backup{
+				arktest.NewTestBackup().WithName("backup-1").
+					WithExpiration(fakeClock.Now().Add(-1*time.Second)).
+					WithSnapshot("pv-1", "snapshot-1").
+					WithSnapshot("pv-2", "snapshot-2").
+					Backup,
 			},
-			snapshots: sets.NewString("snapshot-1", "snapshot-2"),
-			expectedBackupsRemaining: map[string]sets.String{
-				"bucket-1": sets.NewString("backup-1"),
-			},
-			expectedSnapshotsRemaining: sets.NewString("snapshot-1", "snapshot-2"),
+			expectedDeletions: sets.NewString("backup-1"),
 		},
-		gcTest{
-			name:   "one expired, one unexpired",
-			bucket: "bucket-1",
-			backups: map[string][]*api.Backup{
-				"bucket-1": []*api.Backup{
-					NewTestBackup().WithName("backup-1").
-						WithExpiration(fakeClock.Now().Add(-1*time.Minute)).
-						WithSnapshot("pv-1", "snapshot-1").
-						WithSnapshot("pv-2", "snapshot-2").
-						Backup,
-					NewTestBackup().WithName("backup-2").
-						WithExpiration(fakeClock.Now().Add(1*time.Minute)).
-						WithSnapshot("pv-3", "snapshot-3").
-						WithSnapshot("pv-4", "snapshot-4").
-						Backup,
-				},
+		{
+			name: "unexpired backup is not deleted",
+			backups: []*api.Backup{
+				arktest.NewTestBackup().WithName("backup-1").
+					WithExpiration(fakeClock.Now().Add(1*time.Minute)).
+					WithSnapshot("pv-1", "snapshot-1").
+					WithSnapshot("pv-2", "snapshot-2").
+					Backup,
 			},
-			snapshots: sets.NewString("snapshot-1", "snapshot-2", "snapshot-3", "snapshot-4"),
-			expectedBackupsRemaining: map[string]sets.String{
-				"bucket-1": sets.NewString("backup-2"),
-			},
-			expectedSnapshotsRemaining: sets.NewString("snapshot-3", "snapshot-4"),
+			expectedDeletions: sets.NewString(),
 		},
-		gcTest{
-			name:   "none expired in target bucket",
-			bucket: "bucket-2",
-			backups: map[string][]*api.Backup{
-				"bucket-1": []*api.Backup{
-					NewTestBackup().WithName("backup-1").
-						WithExpiration(fakeClock.Now().Add(-1*time.Minute)).
-						WithSnapshot("pv-1", "snapshot-1").
-						WithSnapshot("pv-2", "snapshot-2").
-						Backup,
-				},
-				"bucket-2": []*api.Backup{
-					NewTestBackup().WithName("backup-2").
-						WithExpiration(fakeClock.Now().Add(1*time.Minute)).
-						WithSnapshot("pv-3", "snapshot-3").
-						WithSnapshot("pv-4", "snapshot-4").
-						Backup,
-				},
+		{
+			name: "expired backup is deleted and unexpired backup is not deleted",
+			backups: []*api.Backup{
+				arktest.NewTestBackup().WithName("backup-1").
+					WithExpiration(fakeClock.Now().Add(-1*time.Minute)).
+					WithSnapshot("pv-1", "snapshot-1").
+					WithSnapshot("pv-2", "snapshot-2").
+					Backup,
+				arktest.NewTestBackup().WithName("backup-2").
+					WithExpiration(fakeClock.Now().Add(1*time.Minute)).
+					WithSnapshot("pv-3", "snapshot-3").
+					WithSnapshot("pv-4", "snapshot-4").
+					Backup,
 			},
-			snapshots: sets.NewString("snapshot-1", "snapshot-2", "snapshot-3", "snapshot-4"),
-			expectedBackupsRemaining: map[string]sets.String{
-				"bucket-1": sets.NewString("backup-1"),
-				"bucket-2": sets.NewString("backup-2"),
-			},
-			expectedSnapshotsRemaining: sets.NewString("snapshot-1", "snapshot-2", "snapshot-3", "snapshot-4"),
-		},
-		gcTest{
-			name:   "orphan snapshots",
-			bucket: "bucket-1",
-			backups: map[string][]*api.Backup{
-				"bucket-1": []*api.Backup{
-					NewTestBackup().WithName("backup-1").
-						WithExpiration(fakeClock.Now().Add(-1*time.Minute)).
-						WithSnapshot("pv-1", "snapshot-1").
-						WithSnapshot("pv-2", "snapshot-2").
-						Backup,
-				},
-			},
-			snapshots:                  sets.NewString("snapshot-1", "snapshot-2", "snapshot-3", "snapshot-4"),
-			expectedBackupsRemaining:   make(map[string]sets.String),
-			expectedSnapshotsRemaining: sets.NewString("snapshot-3", "snapshot-4"),
+			expectedDeletions: sets.NewString("backup-1"),
 		},
 	}
 
 	for _, test := range tests {
-		backupService := &fakeBackupService{}
-		snapshotService := &FakeSnapshotService{}
-
 		t.Run(test.name, func(t *testing.T) {
-			backupService.backupsByBucket = make(map[string][]*api.Backup)
-
-			for bucket, backups := range test.backups {
-				data := make([]*api.Backup, 0, len(backups))
-				for _, backup := range backups {
-					data = append(data, backup)
-				}
-
-				backupService.backupsByBucket[bucket] = data
-			}
-
-			snapshotService.SnapshotsTaken = test.snapshots
-
 			var (
 				client          = fake.NewSimpleClientset()
 				sharedInformers = informers.NewSharedInformerFactory(client, 0)
 			)
 
 			controller := NewGCController(
-				backupService,
-				snapshotService,
-				test.bucket,
+				nil,
+				nil,
+				"bucket",
 				1*time.Millisecond,
 				sharedInformers.Ark().V1().Backups(),
 				client.ArkV1(),
+				sharedInformers.Ark().V1().Restores(),
+				client.ArkV1(),
+				arktest.NewLogger(),
 			).(*gcController)
 			controller.clock = fakeClock
 
-			controller.cleanBackups()
+			for _, backup := range test.backups {
+				sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(backup)
+			}
 
-			// verify every bucket has the backups we expect
-			for bucket, backups := range backupService.backupsByBucket {
-				// if actual and expected are both empty, no further verification needed
-				if len(backups) == 0 && len(test.expectedBackupsRemaining[bucket]) == 0 {
+			expectedDeletions := make([]core.Action, 0, len(test.expectedDeletions))
+			for backup := range test.expectedDeletions {
+				expectedDeletions = append(expectedDeletions, core.NewDeleteAction(
+					api.SchemeGroupVersion.WithResource("backups"),
+					api.DefaultNamespace,
+					backup,
+				))
+			}
+
+			controller.run()
+
+			assert.Equal(t, expectedDeletions, client.Actions())
+		})
+	}
+}
+
+func TestGarbageCollectBackup(t *testing.T) {
+	tests := []struct {
+		name                   string
+		backup                 *api.Backup
+		snapshots              sets.String
+		restores               []*api.Restore
+		nilSnapshotService     bool
+		expectErr              bool
+		expectBackupDirDeleted bool
+	}{
+		{
+			name:               "nil snapshot service when backup has snapshots returns error",
+			backup:             arktest.NewTestBackup().WithName("backup-1").WithSnapshot("pv-1", "snap-1").Backup,
+			nilSnapshotService: true,
+			expectErr:          true,
+		},
+		{
+			name:                   "nil snapshot service when backup doesn't have snapshots correctly garbage-collects",
+			backup:                 arktest.NewTestBackup().WithName("backup-1").Backup,
+			nilSnapshotService:     true,
+			expectBackupDirDeleted: true,
+		},
+		{
+			name: "return error if snapshot deletion fails",
+			backup: arktest.NewTestBackup().WithName("backup-1").
+				WithSnapshot("pv-1", "snapshot-1").
+				WithSnapshot("pv-2", "snapshot-2").
+				Backup,
+			snapshots:              sets.NewString("snapshot-1"),
+			expectBackupDirDeleted: true,
+			expectErr:              true,
+		},
+		{
+			name:      "related restores should be deleted",
+			backup:    arktest.NewTestBackup().WithName("backup-1").Backup,
+			snapshots: sets.NewString(),
+			restores: []*api.Restore{
+				arktest.NewTestRestore(api.DefaultNamespace, "restore-1", api.RestorePhaseCompleted).WithBackup("backup-1").Restore,
+				arktest.NewTestRestore(api.DefaultNamespace, "restore-2", api.RestorePhaseCompleted).WithBackup("backup-2").Restore,
+			},
+			expectBackupDirDeleted: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var (
+				backupService   = &arktest.BackupService{}
+				snapshotService = &arktest.FakeSnapshotService{SnapshotsTaken: test.snapshots}
+				client          = fake.NewSimpleClientset()
+				sharedInformers = informers.NewSharedInformerFactory(client, 0)
+				controller      = NewGCController(
+					backupService,
+					snapshotService,
+					"bucket-1",
+					1*time.Millisecond,
+					sharedInformers.Ark().V1().Backups(),
+					client.ArkV1(),
+					sharedInformers.Ark().V1().Restores(),
+					client.ArkV1(),
+					arktest.NewLogger(),
+				).(*gcController)
+			)
+
+			if test.nilSnapshotService {
+				controller.snapshotService = nil
+			}
+
+			sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(test.backup)
+			for _, restore := range test.restores {
+				sharedInformers.Ark().V1().Restores().Informer().GetStore().Add(restore)
+			}
+
+			if test.expectBackupDirDeleted {
+				backupService.On("DeleteBackupDir", controller.bucket, test.backup.Name).Return(nil)
+			}
+
+			// METHOD UNDER TEST
+			err := controller.garbageCollect(test.backup, controller.logger)
+
+			// VERIFY:
+
+			// error
+			assert.Equal(t, test.expectErr, err != nil)
+
+			// remaining snapshots
+			if !test.nilSnapshotService {
+				backupSnapshots := sets.NewString()
+				for _, snapshot := range test.backup.Status.VolumeBackups {
+					backupSnapshots.Insert(snapshot.SnapshotID)
+				}
+
+				assert.Equal(t, test.snapshots.Difference(backupSnapshots), snapshotService.SnapshotsTaken)
+			}
+
+			// restore client deletes
+			expectedActions := make([]core.Action, 0)
+			for _, restore := range test.restores {
+				if restore.Spec.BackupName != test.backup.Name {
 					continue
 				}
 
-				// get all the actual backups remaining in this bucket
-				backupNames := sets.NewString()
-				for _, backup := range backupService.backupsByBucket[bucket] {
-					backupNames.Insert(backup.Name)
-				}
-
-				assert.Equal(t, test.expectedBackupsRemaining[bucket], backupNames)
+				action := core.NewDeleteAction(
+					api.SchemeGroupVersion.WithResource("restores"),
+					api.DefaultNamespace,
+					restore.Name,
+				)
+				expectedActions = append(expectedActions, action)
 			}
+			assert.Equal(t, expectedActions, client.Actions())
 
-			assert.Equal(t, test.expectedSnapshotsRemaining, snapshotService.SnapshotsTaken)
+			// backup dir deletion
+			backupService.AssertExpectations(t)
 		})
 	}
 }
 
 func TestGarbageCollectPicksUpBackupUponExpiration(t *testing.T) {
 	var (
-		backupService   = &fakeBackupService{}
-		snapshotService = &FakeSnapshotService{}
 		fakeClock       = clock.NewFakeClock(time.Now())
-		assert          = assert.New(t)
-	)
-
-	scenario := gcTest{
-		name:   "basic-expired",
-		bucket: "bucket-1",
-		backups: map[string][]*api.Backup{
-			"bucket-1": []*api.Backup{
-				NewTestBackup().WithName("backup-1").
-					WithExpiration(fakeClock.Now().Add(1*time.Second)).
-					WithSnapshot("pv-1", "snapshot-1").
-					WithSnapshot("pv-2", "snapshot-2").
-					Backup,
-			},
-		},
-		snapshots: sets.NewString("snapshot-1", "snapshot-2"),
-	}
-
-	backupService.backupsByBucket = make(map[string][]*api.Backup)
-
-	for bucket, backups := range scenario.backups {
-		data := make([]*api.Backup, 0, len(backups))
-		for _, backup := range backups {
-			data = append(data, backup)
-		}
-
-		backupService.backupsByBucket[bucket] = data
-	}
-
-	snapshotService.SnapshotsTaken = scenario.snapshots
-
-	var (
 		client          = fake.NewSimpleClientset()
 		sharedInformers = informers.NewSharedInformerFactory(client, 0)
+		backup          = arktest.NewTestBackup().WithName("backup-1").
+				WithExpiration(fakeClock.Now().Add(1*time.Second)).
+				WithSnapshot("pv-1", "snapshot-1").
+				WithSnapshot("pv-2", "snapshot-2").
+				Backup
 	)
 
 	controller := NewGCController(
-		backupService,
-		snapshotService,
-		scenario.bucket,
+		nil,
+		nil,
+		"bucket",
 		1*time.Millisecond,
 		sharedInformers.Ark().V1().Backups(),
 		client.ArkV1(),
+		sharedInformers.Ark().V1().Restores(),
+		client.ArkV1(),
+		arktest.NewLogger(),
 	).(*gcController)
 	controller.clock = fakeClock
 
-	// PASS 1
-	controller.cleanBackups()
+	sharedInformers.Ark().V1().Backups().Informer().GetStore().Add(backup)
 
-	assert.Equal(scenario.backups, backupService.backupsByBucket, "backups should not be garbage-collected yet.")
-	assert.Equal(scenario.snapshots, snapshotService.SnapshotsTaken, "snapshots should not be garbage-collected yet.")
+	// PASS 1
+	controller.run()
+	assert.Equal(t, 0, len(client.Actions()))
 
 	// PASS 2
+	expectedActions := []core.Action{
+		core.NewDeleteAction(
+			api.SchemeGroupVersion.WithResource("backups"),
+			api.DefaultNamespace,
+			"backup-1",
+		),
+	}
+
 	fakeClock.Step(1 * time.Minute)
-	controller.cleanBackups()
+	controller.run()
 
-	assert.Equal(0, len(backupService.backupsByBucket[scenario.bucket]), "backups should have been garbage-collected.")
-	assert.Equal(0, len(snapshotService.SnapshotsTaken), "snapshots should have been garbage-collected.")
+	assert.Equal(t, expectedActions, client.Actions())
 }
 
-type fakeBackupService struct {
-	backupsByBucket map[string][]*api.Backup
-	mock.Mock
-}
-
-func (s *fakeBackupService) GetAllBackups(bucket string) ([]*api.Backup, error) {
-	backups, found := s.backupsByBucket[bucket]
-	if !found {
-		return nil, errors.New("bucket not found")
-	}
-	return backups, nil
-}
-
-func (bs *fakeBackupService) UploadBackup(bucket, name string, metadata, backup io.ReadSeeker) error {
-	args := bs.Called(bucket, name, metadata, backup)
-	return args.Error(0)
-}
-
-func (s *fakeBackupService) DownloadBackup(bucket, name string) (io.ReadCloser, error) {
-	return ioutil.NopCloser(bytes.NewReader([]byte("hello world"))), nil
-}
-
-func (s *fakeBackupService) DeleteBackup(bucket, backupName string) error {
-	backups, err := s.GetAllBackups(bucket)
-	if err != nil {
-		return err
-	}
-
-	deleteIdx := -1
-	for i, backup := range backups {
-		if backup.Name == backupName {
-			deleteIdx = i
-			break
-		}
+func TestHandleFinalizer(t *testing.T) {
+	tests := []struct {
+		name                 string
+		backup               *api.Backup
+		deleteBackupDirError bool
+		expectGarbageCollect bool
+		expectedPatch        []byte
+	}{
+		{
+			name:   "nil deletionTimestamp exits early",
+			backup: arktest.NewTestBackup().Backup,
+		},
+		{
+			name:   "no finalizers exits early",
+			backup: arktest.NewTestBackup().WithDeletionTimestamp(time.Now()).Backup,
+		},
+		{
+			name:   "no GCFinalizer exits early",
+			backup: arktest.NewTestBackup().WithDeletionTimestamp(time.Now()).WithFinalizers("foo").Backup,
+		},
+		{
+			name:                 "error when calling garbageCollect exits without patch",
+			backup:               arktest.NewTestBackup().WithDeletionTimestamp(time.Now()).WithFinalizers(api.GCFinalizer).Backup,
+			deleteBackupDirError: true,
+		},
+		{
+			name:                 "normal case - patch includes the appropriate fields",
+			backup:               arktest.NewTestBackup().WithDeletionTimestamp(time.Now()).WithFinalizers(api.GCFinalizer, "foo").WithResourceVersion("1").Backup,
+			expectGarbageCollect: true,
+			expectedPatch:        []byte(`{"metadata":{"finalizers":["foo"],"resourceVersion":"1"}}`),
+		},
 	}
 
-	if deleteIdx == -1 {
-		return errors.New("backup not found")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var (
+				backupService   = &arktest.BackupService{}
+				client          = fake.NewSimpleClientset()
+				sharedInformers = informers.NewSharedInformerFactory(client, 0)
+				controller      = NewGCController(
+					backupService,
+					nil,
+					"bucket-1",
+					1*time.Millisecond,
+					sharedInformers.Ark().V1().Backups(),
+					client.ArkV1(),
+					sharedInformers.Ark().V1().Restores(),
+					client.ArkV1(),
+					arktest.NewLogger(),
+				).(*gcController)
+			)
+
+			if test.expectGarbageCollect {
+				backupService.On("DeleteBackupDir", controller.bucket, test.backup.Name).Return(nil)
+			} else if test.deleteBackupDirError {
+				backupService.On("DeleteBackupDir", controller.bucket, test.backup.Name).Return(errors.New("foo"))
+			}
+
+			// METHOD UNDER TEST
+			controller.handleFinalizer(test.backup)
+
+			// VERIFY
+			backupService.AssertExpectations(t)
+
+			actions := client.Actions()
+
+			if test.expectedPatch == nil {
+				assert.Equal(t, 0, len(actions))
+				return
+			}
+
+			require.Equal(t, 1, len(actions))
+			patchAction, ok := actions[0].(core.PatchAction)
+			require.True(t, ok, "action is not a PatchAction")
+
+			assert.Equal(t, test.expectedPatch, patchAction.GetPatch())
+		})
 	}
-
-	s.backupsByBucket[bucket] = append(s.backupsByBucket[bucket][0:deleteIdx], s.backupsByBucket[bucket][deleteIdx+1:]...)
-
-	return nil
 }

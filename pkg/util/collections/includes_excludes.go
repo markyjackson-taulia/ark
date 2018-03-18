@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@ limitations under the License.
 package collections
 
 import (
-	"errors"
-	"fmt"
+	"strings"
+
+	"github.com/pkg/errors"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 )
@@ -71,9 +72,37 @@ func (ie *IncludesExcludes) ShouldInclude(s string) bool {
 		return false
 	}
 
-	return ie.includes.Has("*") || ie.includes.Has(s)
+	// len=0 means include everything
+	return ie.includes.Len() == 0 || ie.includes.Has("*") || ie.includes.Has(s)
 }
 
+// IncludesString returns a string containing all of the includes, separated by commas, or * if the
+// list is empty.
+func (ie *IncludesExcludes) IncludesString() string {
+	return asString(ie.GetIncludes())
+}
+
+// ExcludesString returns a string containing all of the excludes, separated by commas, or * if the
+// list is empty.
+func (ie *IncludesExcludes) ExcludesString() string {
+	return asString(ie.GetExcludes())
+}
+
+func asString(in []string) string {
+	if len(in) == 0 {
+		return "*"
+	}
+	return strings.Join(in, ", ")
+}
+
+// IncludeEverything returns true if the includes list is empty or '*'
+// and the excludes list is empty, or false otherwise.
+func (ie *IncludesExcludes) IncludeEverything() bool {
+	return ie.excludes.Len() == 0 && (ie.includes.Len() == 0 || (ie.includes.Len() == 1 && ie.includes.Has("*")))
+}
+
+// ValidateIncludesExcludes checks provided lists of included and excluded
+// items to ensure they are a valid set of IncludesExcludes data.
 func ValidateIncludesExcludes(includesList, excludesList []string) []error {
 	// TODO we should not allow an IncludesExcludes object to be created that
 	// does not meet these criteria. Do a more significant refactoring to embed
@@ -83,10 +112,6 @@ func ValidateIncludesExcludes(includesList, excludesList []string) []error {
 
 	includes := sets.NewString(includesList...)
 	excludes := sets.NewString(excludesList...)
-
-	if includes.Len() == 0 {
-		errs = append(errs, errors.New("includes list cannot be empty"))
-	}
 
 	if includes.Len() > 1 && includes.Has("*") {
 		errs = append(errs, errors.New("includes list must either contain '*' only, or a non-empty list of items"))
@@ -98,9 +123,40 @@ func ValidateIncludesExcludes(includesList, excludesList []string) []error {
 
 	for _, itm := range excludes.List() {
 		if includes.Has(itm) {
-			errs = append(errs, errors.New(fmt.Sprintf("excludes list cannot contain an item in the includes list: %v", itm)))
+			errs = append(errs, errors.Errorf("excludes list cannot contain an item in the includes list: %v", itm))
 		}
 	}
 
 	return errs
+}
+
+// GenerateIncludesExcludes constructs an IncludesExcludes struct by taking the provided
+// include/exclude slices, applying the specified mapping function to each item in them,
+// and adding the output of the function to the new struct. If the mapping function returns
+// an empty string for an item, it is omitted from the result.
+func GenerateIncludesExcludes(includes, excludes []string, mapFunc func(string) string) *IncludesExcludes {
+	res := NewIncludesExcludes()
+
+	for _, item := range includes {
+		if item == "*" {
+			res.Includes(item)
+			continue
+		}
+
+		key := mapFunc(item)
+		if key == "" {
+			continue
+		}
+		res.Includes(key)
+	}
+
+	for _, item := range excludes {
+		key := mapFunc(item)
+		if key == "" {
+			continue
+		}
+		res.Excludes(key)
+	}
+
+	return res
 }

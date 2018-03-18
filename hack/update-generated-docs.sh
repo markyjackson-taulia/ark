@@ -1,6 +1,6 @@
 #!/bin/bash -e
 #
-# Copyright 2017 Heptio Inc.
+# Copyright 2017 the Heptio Ark contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARK_ROOT=$(realpath $(dirname ${BASH_SOURCE})/..)
+ARK_ROOT=$(dirname ${BASH_SOURCE})/..
 BIN=${ARK_ROOT}/_output/bin
 mkdir -p ${BIN}
+
+echo "Updating generated docs"
+
 go build -o ${BIN}/docs-gen ./docs/generate/ark.go
 
 if [[ $# -gt 1 ]]; then
@@ -30,3 +33,5 @@ if [[ -z "${OUTPUT_DIR}" ]]; then
 fi
 
 ${BIN}/docs-gen ark ${OUTPUT_DIR}
+
+echo "Success!"

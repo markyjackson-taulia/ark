@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,17 +18,17 @@ package main
 
 import (
 	"log"
-  "os"
+	"os"
 
-	"github.com/spf13/cobra/doc"
 	"github.com/heptio/ark/pkg/cmd/ark"
+	"github.com/spf13/cobra/doc"
 )
 
 func main() {
-  cmdName := os.Args[1]
+	cmdName := os.Args[1]
 	outputDir := os.Args[2]
 
-  cmd := ark.NewCommand(cmdName)
+	cmd := ark.NewCommand(cmdName)
 	// Remove auto-generated timestamps
 	cmd.DisableAutoGenTag = true
 

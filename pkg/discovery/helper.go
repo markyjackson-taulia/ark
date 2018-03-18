@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,25 +21,26 @@ import (
 	"sync"
 
 	kcmdutil "github.com/heptio/ark/third_party/kubernetes/pkg/kubectl/cmd/util"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/pkg/api"
 )
 
 // Helper exposes functions for interacting with the Kubernetes discovery
 // API.
 type Helper interface {
-	// Mapper gets a RESTMapper for the current set of resources retrieved
-	// from discovery.
-	Mapper() meta.RESTMapper
-
 	// Resources gets the current set of resources retrieved from discovery
 	// that are backuppable by Ark.
 	Resources() []*metav1.APIResourceList
+
+	// ResourceFor gets a fully-resolved GroupVersionResource and an
+	// APIResource for the provided partially-specified GroupVersionResource.
+	ResourceFor(input schema.GroupVersionResource) (schema.GroupVersionResource, metav1.APIResource, error)
 
 	// Refresh pulls an updated set of Ark-backuppable resources from the
 	// discovery API.
@@ -48,16 +49,18 @@ type Helper interface {
 
 type helper struct {
 	discoveryClient discovery.DiscoveryInterface
+	logger          logrus.FieldLogger
 
-	// lock guards mapper and resources
-	lock      sync.RWMutex
-	mapper    meta.RESTMapper
-	resources []*metav1.APIResourceList
+	// lock guards mapper, resources and resourcesMap
+	lock         sync.RWMutex
+	mapper       meta.RESTMapper
+	resources    []*metav1.APIResourceList
+	resourcesMap map[schema.GroupVersionResource]metav1.APIResource
 }
 
 var _ Helper = &helper{}
 
-func NewHelper(discoveryClient discovery.DiscoveryInterface) (Helper, error) {
+func NewHelper(discoveryClient discovery.DiscoveryInterface, logger logrus.FieldLogger) (Helper, error) {
 	h := &helper{
 		discoveryClient: discoveryClient,
 	}
@@ -67,37 +70,64 @@ func NewHelper(discoveryClient discovery.DiscoveryInterface) (Helper, error) {
 	return h, nil
 }
 
+func (h *helper) ResourceFor(input schema.GroupVersionResource) (schema.GroupVersionResource, metav1.APIResource, error) {
+	h.lock.RLock()
+	defer h.lock.RUnlock()
+
+	gvr, err := h.mapper.ResourceFor(input)
+	if err != nil {
+		return schema.GroupVersionResource{}, metav1.APIResource{}, err
+	}
+
+	apiResource, found := h.resourcesMap[gvr]
+	if !found {
+		return schema.GroupVersionResource{}, metav1.APIResource{}, errors.Errorf("APIResource not found for GroupVersionResource %s", gvr)
+	}
+
+	return gvr, apiResource, nil
+}
+
 func (h *helper) Refresh() error {
 	h.lock.Lock()
 	defer h.lock.Unlock()
 
 	groupResources, err := discovery.GetAPIGroupResources(h.discoveryClient)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	mapper := discovery.NewRESTMapper(groupResources, dynamic.VersionInterfaces)
-	shortcutExpander, err := kcmdutil.NewShortcutExpander(mapper, h.discoveryClient)
+	shortcutExpander, err := kcmdutil.NewShortcutExpander(mapper, h.discoveryClient, h.logger)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	h.mapper = shortcutExpander
 
 	preferredResources, err := h.discoveryClient.ServerPreferredResources()
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	h.resources = discovery.FilteredBy(
 		discovery.ResourcePredicateFunc(func(groupVersion string, r *metav1.APIResource) bool {
-			if groupVersion == api.SchemeGroupVersion.String() {
-				return false
-			}
 			return discovery.SupportsAllVerbs{Verbs: []string{"list", "create"}}.Match(groupVersion, r)
 		}),
 		preferredResources,
 	)
 
 	sortResources(h.resources)
+
+	h.resourcesMap = make(map[schema.GroupVersionResource]metav1.APIResource)
+	for _, resourceGroup := range h.resources {
+		gv, err := schema.ParseGroupVersion(resourceGroup.GroupVersion)
+		if err != nil {
+			return errors.Wrapf(err, "unable to parse GroupVersion %s", resourceGroup.GroupVersion)
+		}
+
+		for _, resource := range resourceGroup.APIResources {
+			gvr := gv.WithResource(resource.Name)
+			h.resourcesMap[gvr] = resource
+		}
+	}
 
 	return nil
 }
@@ -126,12 +156,6 @@ func sortResources(resources []*metav1.APIResourceList) {
 
 		return i < j
 	})
-}
-
-func (h *helper) Mapper() meta.RESTMapper {
-	h.lock.RLock()
-	defer h.lock.RUnlock()
-	return h.mapper
 }
 
 func (h *helper) Resources() []*metav1.APIResourceList {

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -24,36 +25,30 @@ import (
 
 	core "k8s.io/client-go/testing"
 
-	api "github.com/heptio/ark/pkg/apis/ark/v1"
-	"github.com/heptio/ark/pkg/generated/clientset/fake"
-	. "github.com/heptio/ark/pkg/util/test"
+	"github.com/heptio/ark/pkg/apis/ark/v1"
+	"github.com/heptio/ark/pkg/generated/clientset/versioned/fake"
+	arktest "github.com/heptio/ark/pkg/util/test"
 )
 
-func TestRun(t *testing.T) {
+func TestBackupSyncControllerRun(t *testing.T) {
 	tests := []struct {
-		name         string
-		cloudBackups map[string][]*api.Backup
-		backupSvcErr error
+		name               string
+		getAllBackupsError error
+		cloudBackups       []*v1.Backup
 	}{
 		{
 			name: "no cloud backups",
 		},
 		{
-			name: "backup service returns error on GetAllBackups",
-			cloudBackups: map[string][]*api.Backup{
-				"nonexistent-bucket": []*api.Backup{
-					NewTestBackup().WithNamespace("ns-1").WithName("backup-1").Backup,
-				},
-			},
+			name:               "backup service returns error on GetAllBackups",
+			getAllBackupsError: errors.New("getAllBackups"),
 		},
 		{
 			name: "normal case",
-			cloudBackups: map[string][]*api.Backup{
-				"bucket": []*api.Backup{
-					NewTestBackup().WithNamespace("ns-1").WithName("backup-1").Backup,
-					NewTestBackup().WithNamespace("ns-1").WithName("backup-2").Backup,
-					NewTestBackup().WithNamespace("ns-2").WithName("backup-3").Backup,
-				},
+			cloudBackups: []*v1.Backup{
+				arktest.NewTestBackup().WithNamespace("ns-1").WithName("backup-1").Backup,
+				arktest.NewTestBackup().WithNamespace("ns-1").WithName("backup-2").Backup,
+				arktest.NewTestBackup().WithNamespace("ns-2").WithName("backup-3").Backup,
 			},
 		},
 	}
@@ -61,8 +56,9 @@ func TestRun(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var (
-				bs     = &fakeBackupService{backupsByBucket: test.cloudBackups}
+				bs     = &arktest.BackupService{}
 				client = fake.NewSimpleClientset()
+				logger = arktest.NewLogger()
 			)
 
 			c := NewBackupSyncController(
@@ -70,16 +66,19 @@ func TestRun(t *testing.T) {
 				bs,
 				"bucket",
 				time.Duration(0),
+				logger,
 			).(*backupSyncController)
+
+			bs.On("GetAllBackups", "bucket").Return(test.cloudBackups, test.getAllBackupsError)
 
 			c.run()
 
 			expectedActions := make([]core.Action, 0)
 
 			// we only expect creates for items within the target bucket
-			for _, cloudBackup := range test.cloudBackups["bucket"] {
+			for _, cloudBackup := range test.cloudBackups {
 				action := core.NewCreateAction(
-					api.SchemeGroupVersion.WithResource("backups"),
+					v1.SchemeGroupVersion.WithResource("backups"),
 					cloudBackup.Namespace,
 					cloudBackup,
 				)
@@ -88,6 +87,7 @@ func TestRun(t *testing.T) {
 			}
 
 			assert.Equal(t, expectedActions, client.Actions())
+			bs.AssertExpectations(t)
 		})
 	}
 }

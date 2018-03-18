@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,6 +21,10 @@ const (
 	// the Ark server and API objects.
 	DefaultNamespace = "heptio-ark"
 
+	// ResourcesDir is a top-level directory expected in backups which contains sub-directories
+	// for each resource type in the backup.
+	ResourcesDir = "resources"
+
 	// RestoreLabelKey is the label key that's applied to all resources that
 	// are created during a restore. This is applied for ease of identification
 	// of restored resources. The value will be the restore's name.
@@ -33,4 +37,8 @@ const (
 	// NamespaceScopedDir is the name of the directory containing namespace-scoped
 	// resource within an Ark backup.
 	NamespaceScopedDir = "namespaces"
+
+	// GCFinalizer is the name of the finalizer Ark uses for backups to allow for the GC Controller to
+	// delete all resources associated with a backup.
+	GCFinalizer = "gc.ark.heptio.com"
 )

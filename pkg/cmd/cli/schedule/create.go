@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ limitations under the License.
 package schedule
 
 import (
-	"errors"
 	"fmt"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
@@ -32,12 +32,24 @@ import (
 	"github.com/heptio/ark/pkg/cmd/util/output"
 )
 
-func NewCreateCommand(f client.Factory) *cobra.Command {
+func NewCreateCommand(f client.Factory, use string) *cobra.Command {
 	o := NewCreateOptions()
 
 	c := &cobra.Command{
-		Use:   "create NAME",
+		Use:   use + " NAME --schedule",
 		Short: "Create a schedule",
+		Long: `The --schedule flag is required, in cron notation:
+
+| Character Position | Character Period | Acceptable Values |
+| -------------------|:----------------:| -----------------:|
+| 1                  | Minute           | 0-59,*            |
+| 2                  | Hour             | 0-23,*            |
+| 3                  | Day of Month     | 1-31,*            |
+| 4                  | Month            | 1-12,*            |
+| 5                  | Day of Week      | 0-7,*             |`,
+
+		Example: `ark create schedule NAME --schedule="0 */6 * * *"`,
+
 		Run: func(c *cobra.Command, args []string) {
 			cmd.CheckError(o.Validate(c, args))
 			cmd.CheckError(o.Complete(args))
@@ -93,7 +105,7 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 
 	schedule := &api.Schedule{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: api.DefaultNamespace,
+			Namespace: f.Namespace(),
 			Name:      o.BackupOptions.Name,
 		},
 		Spec: api.ScheduleSpec{
@@ -103,7 +115,7 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 				IncludedResources:  o.BackupOptions.IncludeResources,
 				ExcludedResources:  o.BackupOptions.ExcludeResources,
 				LabelSelector:      o.BackupOptions.Selector.LabelSelector,
-				SnapshotVolumes:    o.BackupOptions.SnapshotVolumes,
+				SnapshotVolumes:    o.BackupOptions.SnapshotVolumes.Value,
 				TTL:                metav1.Duration{Duration: o.BackupOptions.TTL},
 			},
 			Schedule: o.Schedule,

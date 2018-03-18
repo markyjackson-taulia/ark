@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,219 +24,175 @@ import (
 	"io/ioutil"
 	"strings"
 	"testing"
+	"time"
 
+	testutil "github.com/heptio/ark/pkg/util/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
 
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
 	"github.com/heptio/ark/pkg/util/encode"
+	arktest "github.com/heptio/ark/pkg/util/test"
 )
 
 func TestUploadBackup(t *testing.T) {
 	tests := []struct {
-		name            string
-		bucket          string
-		bucketExists    bool
-		backupName      string
-		metadata        io.ReadSeeker
-		backup          io.ReadSeeker
-		objectStoreErrs map[string]map[string]interface{}
-		expectedErr     bool
-		expectedRes     map[string][]byte
+		name                 string
+		metadata             io.ReadSeeker
+		metadataError        error
+		expectMetadataDelete bool
+		backup               io.ReadSeeker
+		backupError          error
+		expectBackupUpload   bool
+		log                  io.ReadSeeker
+		logError             error
+		expectedErr          string
 	}{
 		{
-			name:         "normal case",
-			bucket:       "test-bucket",
-			bucketExists: true,
-			backupName:   "test-backup",
-			metadata:     newStringReadSeeker("foo"),
-			backup:       newStringReadSeeker("bar"),
-			expectedErr:  false,
-			expectedRes: map[string][]byte{
-				"test-backup/ark-backup.json":    []byte("foo"),
-				"test-backup/test-backup.tar.gz": []byte("bar"),
-			},
+			name:               "normal case",
+			metadata:           newStringReadSeeker("foo"),
+			backup:             newStringReadSeeker("bar"),
+			expectBackupUpload: true,
+			log:                newStringReadSeeker("baz"),
 		},
 		{
-			name:         "no such bucket causes error",
-			bucket:       "test-bucket",
-			bucketExists: false,
-			backupName:   "test-backup",
-			expectedErr:  true,
+			name:          "error on metadata upload does not upload data",
+			metadata:      newStringReadSeeker("foo"),
+			metadataError: errors.New("md"),
+			log:           newStringReadSeeker("baz"),
+			expectedErr:   "md",
 		},
 		{
-			name:         "error on metadata upload does not upload data",
-			bucket:       "test-bucket",
-			bucketExists: true,
-			backupName:   "test-backup",
-			metadata:     newStringReadSeeker("foo"),
-			backup:       newStringReadSeeker("bar"),
-			objectStoreErrs: map[string]map[string]interface{}{
-				"putobject": map[string]interface{}{
-					"test-bucket||test-backup/ark-backup.json": true,
-				},
-			},
-			expectedErr: true,
-			expectedRes: make(map[string][]byte),
+			name:                 "error on data upload deletes metadata",
+			metadata:             newStringReadSeeker("foo"),
+			backup:               newStringReadSeeker("bar"),
+			expectBackupUpload:   true,
+			backupError:          errors.New("backup"),
+			expectMetadataDelete: true,
+			expectedErr:          "backup",
 		},
 		{
-			name:         "error on data upload deletes metadata",
-			bucket:       "test-bucket",
-			bucketExists: true,
-			backupName:   "test-backup",
-			metadata:     newStringReadSeeker("foo"),
-			backup:       newStringReadSeeker("bar"),
-			objectStoreErrs: map[string]map[string]interface{}{
-				"putobject": map[string]interface{}{
-					"test-bucket||test-backup/test-backup.tar.gz": true,
-				},
-			},
-			expectedErr: true,
-			expectedRes: make(map[string][]byte),
+			name:               "error on log upload is ok",
+			metadata:           newStringReadSeeker("foo"),
+			backup:             newStringReadSeeker("bar"),
+			expectBackupUpload: true,
+			log:                newStringReadSeeker("baz"),
+			logError:           errors.New("log"),
+		},
+		{
+			name:   "don't upload data when metadata is nil",
+			backup: newStringReadSeeker("bar"),
+			log:    newStringReadSeeker("baz"),
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			objStore := &fakeObjectStorage{
-				returnErrors: test.objectStoreErrs,
-				storage:      make(map[string]map[string][]byte),
+			var (
+				objStore   = &testutil.ObjectStore{}
+				bucket     = "test-bucket"
+				backupName = "test-backup"
+				logger     = arktest.NewLogger()
+			)
+			defer objStore.AssertExpectations(t)
+
+			if test.metadata != nil {
+				objStore.On("PutObject", bucket, backupName+"/ark-backup.json", test.metadata).Return(test.metadataError)
 			}
-			if test.bucketExists {
-				objStore.storage[test.bucket] = make(map[string][]byte)
+			if test.backup != nil && test.expectBackupUpload {
+				objStore.On("PutObject", bucket, backupName+"/"+backupName+".tar.gz", test.backup).Return(test.backupError)
+			}
+			if test.log != nil {
+				objStore.On("PutObject", bucket, backupName+"/"+backupName+"-logs.gz", test.log).Return(test.logError)
+			}
+			if test.expectMetadataDelete {
+				objStore.On("DeleteObject", bucket, backupName+"/ark-backup.json").Return(nil)
 			}
 
-			backupService := NewBackupService(objStore)
+			backupService := NewBackupService(objStore, logger)
 
-			err := backupService.UploadBackup(test.bucket, test.backupName, test.metadata, test.backup)
+			err := backupService.UploadBackup(bucket, backupName, test.metadata, test.backup, test.log)
 
-			assert.Equal(t, test.expectedErr, err != nil, "got error %v", err)
-
-			assert.Equal(t, test.expectedRes, objStore.storage[test.bucket])
+			if test.expectedErr != "" {
+				assert.EqualError(t, err, test.expectedErr)
+			} else {
+				assert.NoError(t, err)
+			}
 
 		})
 	}
 }
 
 func TestDownloadBackup(t *testing.T) {
-	tests := []struct {
-		name        string
-		bucket      string
-		backupName  string
-		storage     map[string]map[string][]byte
-		expectedErr bool
-		expectedRes []byte
-	}{
-		{
-			name:       "normal case",
-			bucket:     "test-bucket",
-			backupName: "test-backup",
-			storage: map[string]map[string][]byte{
-				"test-bucket": map[string][]byte{
-					"test-backup/test-backup.tar.gz": []byte("foo"),
-				},
-			},
-			expectedErr: false,
-			expectedRes: []byte("foo"),
-		},
-		{
-			name:        "no such bucket causes error",
-			bucket:      "test-bucket",
-			backupName:  "test-backup",
-			storage:     map[string]map[string][]byte{},
-			expectedErr: true,
-		},
-		{
-			name:       "no such key causes error",
-			bucket:     "test-bucket",
-			backupName: "test-backup",
-			storage: map[string]map[string][]byte{
-				"test-bucket": map[string][]byte{},
-			},
-			expectedErr: true,
-		},
-	}
+	var (
+		o      = &testutil.ObjectStore{}
+		bucket = "b"
+		backup = "bak"
+		logger = arktest.NewLogger()
+	)
+	o.On("GetObject", bucket, backup+"/"+backup+".tar.gz").Return(ioutil.NopCloser(strings.NewReader("foo")), nil)
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			objStore := &fakeObjectStorage{storage: test.storage}
-			backupService := NewBackupService(objStore)
-
-			rdr, err := backupService.DownloadBackup(test.bucket, test.backupName)
-
-			assert.Equal(t, test.expectedErr, err != nil, "got error %v", err)
-
-			if err == nil {
-				res, err := ioutil.ReadAll(rdr)
-				assert.Nil(t, err)
-				assert.Equal(t, test.expectedRes, res)
-			}
-		})
-	}
+	s := NewBackupService(o, logger)
+	rc, err := s.DownloadBackup(bucket, backup)
+	require.NoError(t, err)
+	require.NotNil(t, rc)
+	data, err := ioutil.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, "foo", string(data))
+	o.AssertExpectations(t)
 }
 
 func TestDeleteBackup(t *testing.T) {
-
 	tests := []struct {
-		name        string
-		bucket      string
-		backupName  string
-		storage     map[string]map[string][]byte
-		expectedErr bool
-		expectedRes map[string][]byte
+		name             string
+		listObjectsError error
+		deleteErrors     []error
+		expectedErr      string
 	}{
 		{
-			name:       "normal case",
-			bucket:     "test-bucket",
-			backupName: "bak",
-			storage: map[string]map[string][]byte{
-				"test-bucket": map[string][]byte{
-					"bak/bak.tar.gz":      nil,
-					"bak/ark-backup.json": nil,
-				},
-			},
-			expectedErr: false,
-			expectedRes: make(map[string][]byte),
+			name: "normal case",
 		},
 		{
-			name:       "failed delete of backup doesn't prevent metadata delete but returns error",
-			bucket:     "test-bucket",
-			backupName: "bak",
-			storage: map[string]map[string][]byte{
-				"test-bucket": map[string][]byte{
-					"bak/ark-backup.json": nil,
-				},
-			},
-			expectedErr: true,
-			expectedRes: make(map[string][]byte),
-		},
-		{
-			name:       "failed delete of metadata returns error",
-			bucket:     "test-bucket",
-			backupName: "bak",
-			storage: map[string]map[string][]byte{
-				"test-bucket": map[string][]byte{
-					"bak/bak.tar.gz": nil,
-				},
-			},
-			expectedErr: true,
-			expectedRes: make(map[string][]byte),
+			name:         "some delete errors, do as much as we can",
+			deleteErrors: []error{errors.New("a"), nil, errors.New("c")},
+			expectedErr:  "[a, c]",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			objStore := &fakeObjectStorage{storage: test.storage}
-			backupService := NewBackupService(objStore)
+			var (
+				bucket   = "bucket"
+				backup   = "bak"
+				objects  = []string{"bak/ark-backup.json", "bak/bak.tar.gz", "bak/bak.log.gz"}
+				objStore = &testutil.ObjectStore{}
+				logger   = arktest.NewLogger()
+			)
 
-			res := backupService.DeleteBackup(test.bucket, test.backupName)
+			objStore.On("ListObjects", bucket, backup+"/").Return(objects, test.listObjectsError)
+			for i, o := range objects {
+				var err error
+				if i < len(test.deleteErrors) {
+					err = test.deleteErrors[i]
+				}
 
-			assert.Equal(t, test.expectedErr, res != nil, "got error %v", res)
+				objStore.On("DeleteObject", bucket, o).Return(err)
+			}
 
-			assert.Equal(t, test.expectedRes, objStore.storage[test.bucket])
+			backupService := NewBackupService(objStore, logger)
+
+			err := backupService.DeleteBackupDir(bucket, backup)
+
+			if test.expectedErr != "" {
+				assert.EqualError(t, err, test.expectedErr)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			objStore.AssertExpectations(t)
 		})
 	}
 }
@@ -244,55 +200,157 @@ func TestDeleteBackup(t *testing.T) {
 func TestGetAllBackups(t *testing.T) {
 	tests := []struct {
 		name        string
-		bucket      string
-		storage     map[string]map[string][]byte
+		storageData map[string][]byte
 		expectedRes []*api.Backup
-		expectedErr bool
+		expectedErr string
 	}{
 		{
-			name:   "normal case",
-			bucket: "test-bucket",
-			storage: map[string]map[string][]byte{
-				"test-bucket": map[string][]byte{
-					"backup-1/ark-backup.json": encodeToBytes(&api.Backup{ObjectMeta: metav1.ObjectMeta{Name: "backup-1"}}),
-					"backup-2/ark-backup.json": encodeToBytes(&api.Backup{ObjectMeta: metav1.ObjectMeta{Name: "backup-2"}}),
-				},
+			name: "normal case",
+			storageData: map[string][]byte{
+				"backup-1/ark-backup.json": encodeToBytes(&api.Backup{ObjectMeta: metav1.ObjectMeta{Name: "backup-1"}}),
+				"backup-2/ark-backup.json": encodeToBytes(&api.Backup{ObjectMeta: metav1.ObjectMeta{Name: "backup-2"}}),
 			},
-			expectedErr: false,
 			expectedRes: []*api.Backup{
-				&api.Backup{
+				{
 					TypeMeta:   metav1.TypeMeta{Kind: "Backup", APIVersion: "ark.heptio.com/v1"},
 					ObjectMeta: metav1.ObjectMeta{Name: "backup-1"},
 				},
-				&api.Backup{
+				{
 					TypeMeta:   metav1.TypeMeta{Kind: "Backup", APIVersion: "ark.heptio.com/v1"},
 					ObjectMeta: metav1.ObjectMeta{Name: "backup-2"},
 				},
 			},
 		},
 		{
-			name:   "decode error returns nil/error",
-			bucket: "test-bucket",
-			storage: map[string]map[string][]byte{
-				"test-bucket": map[string][]byte{
-					"backup-1/ark-backup.json": encodeToBytes(&api.Backup{ObjectMeta: metav1.ObjectMeta{Name: "backup-1"}}),
-					"backup-2/ark-backup.json": []byte("this is not valid backup JSON"),
+			name: "backup that can't be decoded is ignored",
+			storageData: map[string][]byte{
+				"backup-1/ark-backup.json": encodeToBytes(&api.Backup{ObjectMeta: metav1.ObjectMeta{Name: "backup-1"}}),
+				"backup-2/ark-backup.json": []byte("this is not valid backup JSON"),
+			},
+			expectedRes: []*api.Backup{
+				{
+					TypeMeta:   metav1.TypeMeta{Kind: "Backup", APIVersion: "ark.heptio.com/v1"},
+					ObjectMeta: metav1.ObjectMeta{Name: "backup-1"},
 				},
 			},
-			expectedErr: true,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			objStore := &fakeObjectStorage{storage: test.storage}
-			backupService := NewBackupService(objStore)
+			var (
+				bucket   = "bucket"
+				objStore = &testutil.ObjectStore{}
+				logger   = arktest.NewLogger()
+			)
 
-			res, err := backupService.GetAllBackups(test.bucket)
+			objStore.On("ListCommonPrefixes", bucket, "/").Return([]string{"backup-1", "backup-2"}, nil)
+			objStore.On("GetObject", bucket, "backup-1/ark-backup.json").Return(ioutil.NopCloser(bytes.NewReader(test.storageData["backup-1/ark-backup.json"])), nil)
+			objStore.On("GetObject", bucket, "backup-2/ark-backup.json").Return(ioutil.NopCloser(bytes.NewReader(test.storageData["backup-2/ark-backup.json"])), nil)
 
-			assert.Equal(t, test.expectedErr, err != nil, "got error %v", err)
+			backupService := NewBackupService(objStore, logger)
+
+			res, err := backupService.GetAllBackups(bucket)
+
+			if test.expectedErr != "" {
+				assert.EqualError(t, err, test.expectedErr)
+			} else {
+				assert.NoError(t, err)
+			}
 
 			assert.Equal(t, test.expectedRes, res)
+
+			objStore.AssertExpectations(t)
+		})
+	}
+}
+
+func TestCreateSignedURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		targetKind  api.DownloadTargetKind
+		targetName  string
+		expectedKey string
+	}{
+		{
+			name:        "backup contents",
+			targetKind:  api.DownloadTargetKindBackupContents,
+			targetName:  "my-backup",
+			expectedKey: "my-backup/my-backup.tar.gz",
+		},
+		{
+			name:        "backup log",
+			targetKind:  api.DownloadTargetKindBackupLog,
+			targetName:  "my-backup",
+			expectedKey: "my-backup/my-backup-logs.gz",
+		},
+		{
+			name:        "scheduled backup contents",
+			targetKind:  api.DownloadTargetKindBackupContents,
+			targetName:  "my-backup-20170913154901",
+			expectedKey: "my-backup-20170913154901/my-backup-20170913154901.tar.gz",
+		},
+		{
+			name:        "scheduled backup log",
+			targetKind:  api.DownloadTargetKindBackupLog,
+			targetName:  "my-backup-20170913154901",
+			expectedKey: "my-backup-20170913154901/my-backup-20170913154901-logs.gz",
+		},
+		{
+			name:        "restore log - backup has no dash",
+			targetKind:  api.DownloadTargetKindRestoreLog,
+			targetName:  "b-20170913154901",
+			expectedKey: "b/restore-b-20170913154901-logs.gz",
+		},
+		{
+			name:        "restore log - backup has 1 dash",
+			targetKind:  api.DownloadTargetKindRestoreLog,
+			targetName:  "b-cool-20170913154901",
+			expectedKey: "b-cool/restore-b-cool-20170913154901-logs.gz",
+		},
+		{
+			name:        "restore log - backup has multiple dashes (e.g. restore of scheduled backup)",
+			targetKind:  api.DownloadTargetKindRestoreLog,
+			targetName:  "b-cool-20170913154901-20170913154902",
+			expectedKey: "b-cool-20170913154901/restore-b-cool-20170913154901-20170913154902-logs.gz",
+		},
+		{
+			name:        "restore results - backup has no dash",
+			targetKind:  api.DownloadTargetKindRestoreResults,
+			targetName:  "b-20170913154901",
+			expectedKey: "b/restore-b-20170913154901-results.gz",
+		},
+		{
+			name:        "restore results - backup has 1 dash",
+			targetKind:  api.DownloadTargetKindRestoreResults,
+			targetName:  "b-cool-20170913154901",
+			expectedKey: "b-cool/restore-b-cool-20170913154901-results.gz",
+		},
+		{
+			name:        "restore results - backup has multiple dashes (e.g. restore of scheduled backup)",
+			targetKind:  api.DownloadTargetKindRestoreResults,
+			targetName:  "b-cool-20170913154901-20170913154902",
+			expectedKey: "b-cool-20170913154901/restore-b-cool-20170913154901-20170913154902-results.gz",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var (
+				objectStorage = &testutil.ObjectStore{}
+				logger        = arktest.NewLogger()
+				backupService = NewBackupService(objectStorage, logger)
+			)
+
+			target := api.DownloadTarget{
+				Kind: test.targetKind,
+				Name: test.targetName,
+			}
+			objectStorage.On("CreateSignedURL", "bucket", test.expectedKey, time.Duration(0)).Return("url", nil)
+			url, err := backupService.CreateSignedURL(target, "bucket", 0)
+			require.NoError(t, err)
+			assert.Equal(t, "url", url)
+			objectStorage.AssertExpectations(t)
 		})
 	}
 }
@@ -324,84 +382,5 @@ func newStringReadSeeker(s string) *stringReadSeeker {
 }
 
 func (srs *stringReadSeeker) Seek(offset int64, whence int) (int64, error) {
-	panic("not implemented")
-}
-
-type fakeObjectStorage struct {
-	storage      map[string]map[string][]byte
-	returnErrors map[string]map[string]interface{}
-}
-
-func (os *fakeObjectStorage) PutObject(bucket string, key string, body io.ReadSeeker) error {
-	if os.returnErrors["putobject"] != nil && os.returnErrors["putobject"][bucket+"||"+key] != nil {
-		return errors.New("error")
-	}
-
-	if os.storage[bucket] == nil {
-		return errors.New("bucket not found")
-	}
-
-	data, err := ioutil.ReadAll(body)
-	if err != nil {
-		return err
-	}
-
-	os.storage[bucket][key] = data
-
-	return nil
-}
-
-func (os *fakeObjectStorage) GetObject(bucket string, key string) (io.ReadCloser, error) {
-	if os.storage == nil {
-		return nil, errors.New("storage not initialized")
-	}
-	if os.storage[bucket] == nil {
-		return nil, errors.New("bucket not found")
-	}
-
-	if os.storage[bucket][key] == nil {
-		return nil, errors.New("key not found")
-	}
-
-	return ioutil.NopCloser(bytes.NewReader(os.storage[bucket][key])), nil
-}
-
-func (os *fakeObjectStorage) ListCommonPrefixes(bucket string, delimiter string) ([]string, error) {
-	if os.storage == nil {
-		return nil, errors.New("storage not initialized")
-	}
-	if os.storage[bucket] == nil {
-		return nil, errors.New("bucket not found")
-	}
-
-	prefixes := sets.NewString()
-
-	for key := range os.storage[bucket] {
-		delimIdx := strings.LastIndex(key, delimiter)
-
-		if delimIdx == -1 {
-			prefixes.Insert(key)
-		}
-
-		prefixes.Insert(key[0:delimIdx])
-	}
-
-	return prefixes.List(), nil
-}
-
-func (os *fakeObjectStorage) DeleteObject(bucket string, key string) error {
-	if os.storage == nil {
-		return errors.New("storage not initialized")
-	}
-	if os.storage[bucket] == nil {
-		return errors.New("bucket not found")
-	}
-
-	if _, exists := os.storage[bucket][key]; !exists {
-		return errors.New("key not found")
-	}
-
-	delete(os.storage[bucket], key)
-
-	return nil
+	return 0, nil
 }

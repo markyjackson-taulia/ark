@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ package v1
 
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
 // ConfigList is a list of Configs.
 type ConfigList struct {
 	metav1.TypeMeta `json:",inline"`
@@ -26,7 +28,8 @@ type ConfigList struct {
 	Items []Config `json:"items"`
 }
 
-// +genclient=true
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // Config is an Ark resource that captures configuration information to be
 // used for running the Ark server.
@@ -35,8 +38,8 @@ type Config struct {
 	metav1.ObjectMeta `json:"metadata"`
 
 	// PersistentVolumeProvider is the configuration information for the cloud where
-	// the cluster is running and has PersistentVolumes to snapshot or restore.
-	PersistentVolumeProvider CloudProviderConfig `json:"persistentVolumeProvider"`
+	// the cluster is running and has PersistentVolumes to snapshot or restore. Optional.
+	PersistentVolumeProvider *CloudProviderConfig `json:"persistentVolumeProvider"`
 
 	// BackupStorageProvider is the configuration information for the cloud where
 	// Ark backups are stored in object storage. This may be a different cloud than
@@ -66,17 +69,11 @@ type Config struct {
 }
 
 // CloudProviderConfig is configuration information about how to connect
-// to a particular cloud. Only one of the members (AWS, GCP, Azure) may
-// be present.
+// to a particular cloud.
 type CloudProviderConfig struct {
-	// AWS is configuration information for connecting to AWS.
-	AWS *AWSConfig `json:"aws"`
+	Name string `json:"name"`
 
-	// GCP is configuration information for connecting to GCP.
-	GCP *GCPConfig `json:"gcp"`
-
-	// Azure is configuration information for connecting to Azure.
-	Azure *AzureConfig `json:"azure"`
+	Config map[string]string `json:"config"`
 }
 
 // ObjectStorageProviderConfig is configuration information for connecting to
@@ -89,25 +86,4 @@ type ObjectStorageProviderConfig struct {
 	// Bucket is the name of the bucket in object storage where Ark backups
 	// are stored.
 	Bucket string `json:"bucket"`
-}
-
-// AWSConfig is configuration information for connecting to AWS.
-type AWSConfig struct {
-	Region           string `json:"region"`
-	AvailabilityZone string `json:"availabilityZone"`
-	DisableSSL       bool   `json:"disableSSL"`
-	S3ForcePathStyle bool   `json:"s3ForcePathStyle"`
-	S3Url            string `json:"s3Url"`
-}
-
-// GCPConfig is configuration information for connecting to GCP.
-type GCPConfig struct {
-	Project string `json:"project"`
-	Zone    string `json:"zone"`
-}
-
-// AzureConfig is configuration information for connecting to Azure.
-type AzureConfig struct {
-	Location   string          `json:"location"`
-	APITimeout metav1.Duration `json:"apiTimeout"`
 }

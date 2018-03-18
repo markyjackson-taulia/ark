@@ -1,4 +1,4 @@
-# Copyright 2017 Heptio Inc.
+# Copyright 2017 the Heptio Ark contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 apiVersion: apps/v1beta1
 kind: Deployment
 metadata:
-  namespace: heptio-ark
+  namespace: heptio-ark-server
   name: ark
 spec:
   replicas: 1
@@ -34,12 +34,13 @@ spec:
             - /ark
           args:
             - server
-            - --logtostderr
-            - --v
-            - "4"
+            - --namespace
+            - heptio-ark
           volumeMounts:
             - name: cloud-credentials
               mountPath: /credentials
+            - name: plugins
+              mountPath: /plugins
           env:
             - name: AWS_SHARED_CREDENTIALS_FILE
               value: /credentials/cloud
@@ -47,3 +48,5 @@ spec:
         - name: cloud-credentials
           secret:
             secretName: cloud-credentials
+        - name: plugins
+          emptyDir: {}

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ limitations under the License.
 package test
 
 import (
-	"errors"
-
+	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -38,12 +37,12 @@ func (m *FakeMapper) ResourceFor(input schema.GroupVersionResource) (schema.Grou
 		}, nil
 	}
 	if m.Resources == nil {
-		return schema.GroupVersionResource{}, errors.New("invalid resource")
+		return schema.GroupVersionResource{}, errors.Errorf("invalid resource %q", input.String())
 	}
 
 	if gr, found := m.Resources[input]; found {
 		return gr, nil
 	}
 
-	return schema.GroupVersionResource{}, errors.New("invalid resource")
+	return schema.GroupVersionResource{}, errors.Errorf("invalid resource %q", input.String())
 }

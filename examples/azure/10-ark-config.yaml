@@ -1,4 +1,4 @@
-# Copyright 2017 Heptio Inc.
+# Copyright 2017 the Heptio Ark contributors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,14 +19,12 @@ metadata:
   namespace: heptio-ark
   name: default
 persistentVolumeProvider:
-  azure:
-    location: <YOUR_LOCATION>
+  name: azure
+  config:
     apiTimeout: <YOUR_TIMEOUT>
 backupStorageProvider:
+  name: azure
   bucket: <YOUR_BUCKET>
-  azure:
-    location: <YOUR_LOCATION>
-    apiTimeout: <YOUR_TIMEOUT>
 backupSyncPeriod: 30m
 gcSyncPeriod: 30m
 scheduleSyncPeriod: 1m

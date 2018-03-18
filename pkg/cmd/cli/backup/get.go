@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,11 +27,11 @@ import (
 	"github.com/heptio/ark/pkg/cmd/util/output"
 )
 
-func NewGetCommand(f client.Factory) *cobra.Command {
+func NewGetCommand(f client.Factory, use string) *cobra.Command {
 	var listOptions metav1.ListOptions
 
 	c := &cobra.Command{
-		Use:   "get",
+		Use:   use,
 		Short: "Get backups",
 		Run: func(c *cobra.Command, args []string) {
 			err := output.ValidateFlags(c)
@@ -44,12 +44,12 @@ func NewGetCommand(f client.Factory) *cobra.Command {
 			if len(args) > 0 {
 				backups = new(api.BackupList)
 				for _, name := range args {
-					backup, err := arkClient.Ark().Backups(api.DefaultNamespace).Get(name, metav1.GetOptions{})
+					backup, err := arkClient.Ark().Backups(f.Namespace()).Get(name, metav1.GetOptions{})
 					cmd.CheckError(err)
 					backups.Items = append(backups.Items, *backup)
 				}
 			} else {
-				backups, err = arkClient.ArkV1().Backups(api.DefaultNamespace).List(metav1.ListOptions{})
+				backups, err = arkClient.ArkV1().Backups(f.Namespace()).List(listOptions)
 				cmd.CheckError(err)
 			}
 

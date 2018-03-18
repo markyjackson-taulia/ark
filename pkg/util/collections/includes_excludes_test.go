@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,12 @@ limitations under the License.
 package collections
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestShouldInclude(t *testing.T) {
@@ -32,9 +34,9 @@ func TestShouldInclude(t *testing.T) {
 		should   bool
 	}{
 		{
-			name:   "empty - don't include anything",
+			name:   "empty - include everything",
 			check:  "foo",
-			should: false,
+			should: true,
 		},
 		{
 			name:     "include *",
@@ -95,9 +97,8 @@ func TestValidateIncludesExcludes(t *testing.T) {
 		expected []error
 	}{
 		{
-			name:     "include nothing not allowed",
+			name:     "empty includes (everything) is allowed",
 			includes: []string{},
-			expected: []error{errors.New("includes list cannot be empty")},
 		},
 		{
 			name:     "include everything",
@@ -126,7 +127,11 @@ func TestValidateIncludesExcludes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			res := ValidateIncludesExcludes(test.includes, test.excludes)
 
-			assert.Equal(t, test.expected, res)
+			require.Equal(t, len(test.expected), len(res))
+
+			for i := 0; i < len(test.expected); i++ {
+				assert.Equal(t, test.expected[i].Error(), res[i].Error())
+			}
 		})
 	}
 }

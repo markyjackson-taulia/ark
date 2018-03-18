@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -102,5 +102,30 @@ func (b *TestBackup) WithSnapshot(pv string, snapshot string) *TestBackup {
 		b.Status.VolumeBackups = make(map[string]*v1.VolumeBackupInfo)
 	}
 	b.Status.VolumeBackups[pv] = &v1.VolumeBackupInfo{SnapshotID: snapshot}
+	return b
+}
+
+func (b *TestBackup) WithSnapshotVolumes(value bool) *TestBackup {
+	b.Spec.SnapshotVolumes = &value
+	return b
+}
+
+func (b *TestBackup) WithSnapshotVolumesPointer(value *bool) *TestBackup {
+	b.Spec.SnapshotVolumes = value
+	return b
+}
+
+func (b *TestBackup) WithDeletionTimestamp(time time.Time) *TestBackup {
+	b.DeletionTimestamp = &metav1.Time{Time: time}
+	return b
+}
+
+func (b *TestBackup) WithFinalizers(finalizers ...string) *TestBackup {
+	b.Finalizers = finalizers
+	return b
+}
+
+func (b *TestBackup) WithResourceVersion(version string) *TestBackup {
+	b.ResourceVersion = version
 	return b
 }

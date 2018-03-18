@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -61,7 +61,8 @@ type ScheduleStatus struct {
 	ValidationErrors []string `json:"validationErrors"`
 }
 
-// +genclient=true
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // Schedule is an Ark resource that represents a pre-scheduled or
 // periodic Backup that should be run.
@@ -72,6 +73,8 @@ type Schedule struct {
 	Spec   ScheduleSpec   `json:"spec"`
 	Status ScheduleStatus `json:"status,omitempty"`
 }
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // ScheduleList is a list of Schedules.
 type ScheduleList struct {

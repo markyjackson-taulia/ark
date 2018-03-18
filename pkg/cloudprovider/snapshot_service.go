@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,58 +17,59 @@ limitations under the License.
 package cloudprovider
 
 import (
-	"fmt"
 	"time"
+
+	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // SnapshotService exposes Ark-specific operations for snapshotting and restoring block
 // volumes.
 type SnapshotService interface {
-	// GetAllSnapshots returns a slice of all snapshots found in the cloud API that
-	// are tagged with Ark metadata. Returns an error if a problem is encountered accessing
-	// the cloud API.
-	GetAllSnapshots() ([]string, error)
-
 	// CreateSnapshot triggers a snapshot for the specified cloud volume and tags it with metadata.
 	// it returns the cloud snapshot ID, or an error if a problem is encountered triggering the snapshot via
 	// the cloud API.
-	CreateSnapshot(volumeID string) (string, error)
+	CreateSnapshot(volumeID, volumeAZ string, tags map[string]string) (string, error)
 
 	// CreateVolumeFromSnapshot triggers a restore operation to create a new cloud volume from the specified
 	// snapshot and volume characteristics. Returns the cloud volume ID, or an error if a problem is
 	// encountered triggering the restore via the cloud API.
-	CreateVolumeFromSnapshot(snapshotID, volumeType string, iops *int) (string, error)
+	CreateVolumeFromSnapshot(snapshotID, volumeType, volumeAZ string, iops *int64) (string, error)
 
 	// DeleteSnapshot triggers a deletion of the specified Ark snapshot via the cloud API. It returns an
 	// error if a problem is encountered triggering the deletion via the cloud API.
 	DeleteSnapshot(snapshotID string) error
 
 	// GetVolumeInfo gets the type and IOPS (if applicable) from the cloud API.
-	GetVolumeInfo(volumeID string) (string, *int, error)
+	GetVolumeInfo(volumeID, volumeAZ string) (string, *int64, error)
+
+	// GetVolumeID returns the cloud provider specific identifier for the PersistentVolume.
+	GetVolumeID(pv runtime.Unstructured) (string, error)
+
+	// SetVolumeID sets the cloud provider specific identifier for the PersistentVolume.
+	SetVolumeID(pv runtime.Unstructured, volumeID string) (runtime.Unstructured, error)
 }
 
 const (
 	volumeCreateWaitTimeout  = 30 * time.Second
 	volumeCreatePollInterval = 1 * time.Second
-	snapshotTagKey           = "tag-key"
-	snapshotTagVal           = "ark-snapshot"
 )
 
 type snapshotService struct {
-	blockStorage BlockStorageAdapter
+	blockStore BlockStore
 }
 
 var _ SnapshotService = &snapshotService{}
 
-// NewSnapshotService creates a snapshot service using the provided block storage adapter
-func NewSnapshotService(blockStorage BlockStorageAdapter) SnapshotService {
+// NewSnapshotService creates a snapshot service using the provided block store
+func NewSnapshotService(blockStore BlockStore) SnapshotService {
 	return &snapshotService{
-		blockStorage: blockStorage,
+		blockStore: blockStore,
 	}
 }
 
-func (sr *snapshotService) CreateVolumeFromSnapshot(snapshotID string, volumeType string, iops *int) (string, error) {
-	volumeID, err := sr.blockStorage.CreateVolumeFromSnapshot(snapshotID, volumeType, iops)
+func (sr *snapshotService) CreateVolumeFromSnapshot(snapshotID string, volumeType string, volumeAZ string, iops *int64) (string, error) {
+	volumeID, err := sr.blockStore.CreateVolumeFromSnapshot(snapshotID, volumeType, volumeAZ, iops)
 	if err != nil {
 		return "", err
 	}
@@ -82,40 +83,31 @@ func (sr *snapshotService) CreateVolumeFromSnapshot(snapshotID string, volumeTyp
 	for {
 		select {
 		case <-timeout.C:
-			return "", fmt.Errorf("timeout reached waiting for volume %v to be ready", volumeID)
+			return "", errors.Errorf("timeout reached waiting for volume %v to be ready", volumeID)
 		case <-ticker.C:
-			if ready, err := sr.blockStorage.IsVolumeReady(volumeID); err == nil && ready {
+			if ready, err := sr.blockStore.IsVolumeReady(volumeID, volumeAZ); err == nil && ready {
 				return volumeID, nil
 			}
 		}
 	}
 }
 
-func (sr *snapshotService) GetAllSnapshots() ([]string, error) {
-	tags := map[string]string{
-		snapshotTagKey: snapshotTagVal,
-	}
-
-	res, err := sr.blockStorage.ListSnapshots(tags)
-	if err != nil {
-		return nil, err
-	}
-
-	return res, nil
-}
-
-func (sr *snapshotService) CreateSnapshot(volumeID string) (string, error) {
-	tags := map[string]string{
-		snapshotTagKey: snapshotTagVal,
-	}
-
-	return sr.blockStorage.CreateSnapshot(volumeID, tags)
+func (sr *snapshotService) CreateSnapshot(volumeID, volumeAZ string, tags map[string]string) (string, error) {
+	return sr.blockStore.CreateSnapshot(volumeID, volumeAZ, tags)
 }
 
 func (sr *snapshotService) DeleteSnapshot(snapshotID string) error {
-	return sr.blockStorage.DeleteSnapshot(snapshotID)
+	return sr.blockStore.DeleteSnapshot(snapshotID)
 }
 
-func (sr *snapshotService) GetVolumeInfo(volumeID string) (string, *int, error) {
-	return sr.blockStorage.GetVolumeInfo(volumeID)
+func (sr *snapshotService) GetVolumeInfo(volumeID, volumeAZ string) (string, *int64, error) {
+	return sr.blockStore.GetVolumeInfo(volumeID, volumeAZ)
+}
+
+func (sr *snapshotService) GetVolumeID(pv runtime.Unstructured) (string, error) {
+	return sr.blockStore.GetVolumeID(pv)
+}
+
+func (sr *snapshotService) SetVolumeID(pv runtime.Unstructured, volumeID string) (runtime.Unstructured, error) {
+	return sr.blockStore.SetVolumeID(pv, volumeID)
 }

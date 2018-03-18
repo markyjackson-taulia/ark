@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -86,6 +86,9 @@ func printBackup(backup *v1.Backup, w io.Writer, options printers.PrintOptions) 
 	status := backup.Status.Phase
 	if status == "" {
 		status = v1.BackupPhaseNew
+	}
+	if backup.DeletionTimestamp != nil && !backup.DeletionTimestamp.Time.IsZero() {
+		status = "Deleting"
 	}
 
 	if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s", name, status, backup.CreationTimestamp.Time, humanReadableTimeFromNow(expiration), metav1.FormatLabelSelector(backup.Spec.LabelSelector)); err != nil {

@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,13 +34,8 @@ type FakeDynamicFactory struct {
 
 var _ client.DynamicFactory = &FakeDynamicFactory{}
 
-func (df *FakeDynamicFactory) ClientForGroupVersionResource(gvr schema.GroupVersionResource, resource metav1.APIResource, namespace string) (client.Dynamic, error) {
-	args := df.Called(gvr, resource, namespace)
-	return args.Get(0).(client.Dynamic), args.Error(1)
-}
-
-func (df *FakeDynamicFactory) ClientForGroupVersionKind(gvk schema.GroupVersionKind, resource metav1.APIResource, namespace string) (client.Dynamic, error) {
-	args := df.Called(gvk, resource, namespace)
+func (df *FakeDynamicFactory) ClientForGroupVersionResource(gv schema.GroupVersion, resource metav1.APIResource, namespace string) (client.Dynamic, error) {
+	args := df.Called(gv, resource, namespace)
 	return args.Get(0).(client.Dynamic), args.Error(1)
 }
 
@@ -63,4 +58,9 @@ func (c *FakeDynamicClient) Create(obj *unstructured.Unstructured) (*unstructure
 func (c *FakeDynamicClient) Watch(options metav1.ListOptions) (watch.Interface, error) {
 	args := c.Called(options)
 	return args.Get(0).(watch.Interface), args.Error(1)
+}
+
+func (c *FakeDynamicClient) Get(name string, opts metav1.GetOptions) (*unstructured.Unstructured, error) {
+	args := c.Called(name, opts)
+	return args.Get(0).(*unstructured.Unstructured), args.Error(1)
 }

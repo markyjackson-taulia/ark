@@ -23,7 +23,7 @@ If you periodically back up your cluster's resources, you are able to return to 
 
 4. Create a restore with your most recent Ark Backup:
     ```
-    ark restore create <SCHEDULE NAME>-<TIMESTAMP>
+    ark restore create --from-backup <SCHEDULE NAME>-<TIMESTAMP>
     ```
 
 ## Cluster migration
@@ -35,20 +35,19 @@ Heptio Ark can help you port your resources from one cluster to another, as long
 1. *(Cluster 1)* Assuming you haven't already been checkpointing your data with the Ark `schedule` operation, you need to first back up your entire cluster (replacing `<BACKUP-NAME>` as desired):
 
    ```
-   ark backup create <BACKUP-NAME> --snapshot-volumes
+   ark backup create <BACKUP-NAME>
    ```
-   The default TTL is 24 hours; you can use the `--ttl` flag to change this as necessary.
+   The default TTL is 30 days (720 hours); you can use the `--ttl` flag to change this as necessary.
 
 2. *(Cluster 2)* Make sure that the `persistentVolumeProvider` and `backupStorageProvider` fields in the Ark Config match the ones from *Cluster 1*, so that your new Ark server instance is pointing to the same bucket.
 
-3. *(Cluster 2)* Make sure that the Ark Backup object has been created. Ark resources are [synced][2] with the backup files available in cloud storage.
+3. *(Cluster 2)* Make sure that the Ark Backup object has been created. Ark resources are synced with the backup files available in cloud storage.
 
 4. *(Cluster 2)* Once you have confirmed that the right Backup (`<BACKUP-NAME>`) is now present, you can restore everything with:
 ```
-ark restore create <BACKUP-NAME> --restore-volumes
+ark restore create --from-backup <BACKUP-NAME>
 ```
 
 [0]: #disaster-recovery
 [1]: #cluster-migration
-[2]: concepts.md#cloud-storage-sync
 [3]: config-definition.md#main-config-parameters

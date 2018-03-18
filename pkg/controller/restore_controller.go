@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"compress/gzip"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -26,37 +27,52 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
 	api "github.com/heptio/ark/pkg/apis/ark/v1"
 	"github.com/heptio/ark/pkg/cloudprovider"
-	"github.com/heptio/ark/pkg/generated/clientset/scheme"
-	arkv1client "github.com/heptio/ark/pkg/generated/clientset/typed/ark/v1"
+	arkv1client "github.com/heptio/ark/pkg/generated/clientset/versioned/typed/ark/v1"
 	informers "github.com/heptio/ark/pkg/generated/informers/externalversions/ark/v1"
 	listers "github.com/heptio/ark/pkg/generated/listers/ark/v1"
+	"github.com/heptio/ark/pkg/plugin"
 	"github.com/heptio/ark/pkg/restore"
+	"github.com/heptio/ark/pkg/util/collections"
+	kubeutil "github.com/heptio/ark/pkg/util/kube"
 )
 
-type restoreController struct {
-	restoreClient arkv1client.RestoresGetter
-	backupClient  arkv1client.BackupsGetter
-	restorer      restore.Restorer
-	backupService cloudprovider.BackupService
-	bucket        string
+// nonRestorableResources is a blacklist for the restoration process. Any resources
+// included here are explicitly excluded from the restoration process.
+var nonRestorableResources = []string{"nodes", "events", "events.events.k8s.io"}
 
+type restoreController struct {
+	namespace           string
+	restoreClient       arkv1client.RestoresGetter
+	backupClient        arkv1client.BackupsGetter
+	restorer            restore.Restorer
+	backupService       cloudprovider.BackupService
+	bucket              string
+	pvProviderExists    bool
 	backupLister        listers.BackupLister
 	backupListerSynced  cache.InformerSynced
 	restoreLister       listers.RestoreLister
 	restoreListerSynced cache.InformerSynced
 	syncHandler         func(restoreName string) error
 	queue               workqueue.RateLimitingInterface
+	logger              logrus.FieldLogger
+	pluginManager       plugin.Manager
 }
 
 func NewRestoreController(
+	namespace string,
 	restoreInformer informers.RestoreInformer,
 	restoreClient arkv1client.RestoresGetter,
 	backupClient arkv1client.BackupsGetter,
@@ -64,18 +80,25 @@ func NewRestoreController(
 	backupService cloudprovider.BackupService,
 	bucket string,
 	backupInformer informers.BackupInformer,
+	pvProviderExists bool,
+	logger logrus.FieldLogger,
+	pluginManager plugin.Manager,
 ) Interface {
 	c := &restoreController{
+		namespace:           namespace,
 		restoreClient:       restoreClient,
 		backupClient:        backupClient,
 		restorer:            restorer,
 		backupService:       backupService,
 		bucket:              bucket,
+		pvProviderExists:    pvProviderExists,
 		backupLister:        backupInformer.Lister(),
 		backupListerSynced:  backupInformer.Informer().HasSynced,
 		restoreLister:       restoreInformer.Lister(),
 		restoreListerSynced: restoreInformer.Informer().HasSynced,
 		queue:               workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "restore"),
+		logger:              logger,
+		pluginManager:       pluginManager,
 	}
 
 	c.syncHandler = c.processRestore
@@ -89,13 +112,16 @@ func NewRestoreController(
 				case "", api.RestorePhaseNew:
 					// only process new restores
 				default:
-					glog.V(4).Infof("Restore %s/%s has phase %s - skipping", restore.Namespace, restore.Name, restore.Status.Phase)
+					c.logger.WithFields(logrus.Fields{
+						"restore": kubeutil.NamespaceAndName(restore),
+						"phase":   restore.Status.Phase,
+					}).Debug("Restore is not new, skipping")
 					return
 				}
 
 				key, err := cache.MetaNamespaceKeyFunc(restore)
 				if err != nil {
-					glog.Errorf("error creating queue key for %#v: %v", restore, err)
+					c.logger.WithError(errors.WithStack(err)).WithField("restore", restore).Error("Error creating queue key, item not added to queue")
 					return
 				}
 				c.queue.Add(key)
@@ -113,7 +139,7 @@ func (controller *restoreController) Run(ctx context.Context, numWorkers int) er
 	var wg sync.WaitGroup
 
 	defer func() {
-		glog.Infof("Waiting for workers to finish their work")
+		controller.logger.Info("Waiting for workers to finish their work")
 
 		controller.queue.ShutDown()
 
@@ -122,17 +148,17 @@ func (controller *restoreController) Run(ctx context.Context, numWorkers int) er
 		// we want to shut down the queue via defer and not at the end of the body.
 		wg.Wait()
 
-		glog.Infof("All workers have finished")
+		controller.logger.Info("All workers have finished")
 	}()
 
-	glog.Info("Starting RestoreController")
-	defer glog.Info("Shutting down RestoreController")
+	controller.logger.Info("Starting RestoreController")
+	defer controller.logger.Info("Shutting down RestoreController")
 
-	glog.Info("Waiting for caches to sync")
+	controller.logger.Info("Waiting for caches to sync")
 	if !cache.WaitForCacheSync(ctx.Done(), controller.backupListerSynced, controller.restoreListerSynced) {
 		return errors.New("timed out waiting for caches to sync")
 	}
-	glog.Info("Caches are synced")
+	controller.logger.Info("Caches are synced")
 
 	wg.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
@@ -171,7 +197,7 @@ func (controller *restoreController) processNextWorkItem() bool {
 		return true
 	}
 
-	glog.Errorf("syncHandler error: %v", err)
+	controller.logger.WithError(err).WithField("key", key).Error("Error in syncHandler, re-adding item to queue")
 	// we had an error processing the item so add it back
 	// into the queue for re-processing with rate-limiting
 	controller.queue.AddRateLimited(key)
@@ -180,18 +206,18 @@ func (controller *restoreController) processNextWorkItem() bool {
 }
 
 func (controller *restoreController) processRestore(key string) error {
-	glog.V(4).Infof("processRestore for key %q", key)
+	logContext := controller.logger.WithField("key", key)
+
+	logContext.Debug("Running processRestore")
 	ns, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		glog.V(4).Infof("error splitting key %q: %v", key, err)
-		return err
+		return errors.Wrap(err, "error splitting queue key")
 	}
 
-	glog.V(4).Infof("Getting restore %s", key)
+	logContext.Debug("Getting Restore")
 	restore, err := controller.restoreLister.Restores(ns).Get(name)
 	if err != nil {
-		glog.V(4).Infof("error getting restore %s: %v", key, err)
-		return err
+		return errors.Wrap(err, "error getting Restore")
 	}
 
 	// TODO I think this is now unnecessary. We only initially place
@@ -208,12 +234,17 @@ func (controller *restoreController) processRestore(key string) error {
 		return nil
 	}
 
-	glog.V(4).Infof("Cloning restore %s", key)
+	logContext.Debug("Cloning Restore")
+	// store ref to original for creating patch
+	original := restore
 	// don't modify items in the cache
-	restore, err = cloneRestore(restore)
-	if err != nil {
-		glog.V(4).Infof("error cloning restore %s: %v", key, err)
-		return err
+	restore = restore.DeepCopy()
+
+	excludedResources := sets.NewString(restore.Spec.ExcludedResources...)
+	for _, nonrestorable := range nonRestorableResources {
+		if !excludedResources.Has(nonrestorable) {
+			restore.Spec.ExcludedResources = append(restore.Spec.ExcludedResources, nonrestorable)
+		}
 	}
 
 	// validation
@@ -223,49 +254,42 @@ func (controller *restoreController) processRestore(key string) error {
 		restore.Status.Phase = api.RestorePhaseInProgress
 	}
 
-	if len(restore.Spec.Namespaces) == 0 {
-		restore.Spec.Namespaces = []string{"*"}
-	}
-
 	// update status
-	updatedRestore, err := controller.restoreClient.Restores(ns).Update(restore)
+	updatedRestore, err := patchRestore(original, restore, controller.restoreClient)
 	if err != nil {
-		glog.V(4).Infof("error updating status to %s: %v", restore.Status.Phase, err)
-		return err
+		return errors.Wrapf(err, "error updating Restore phase to %s", restore.Status.Phase)
 	}
-	restore = updatedRestore
+	// store ref to just-updated item for creating patch
+	original = updatedRestore
+	restore = updatedRestore.DeepCopy()
 
 	if restore.Status.Phase == api.RestorePhaseFailedValidation {
 		return nil
 	}
 
-	glog.V(4).Infof("running restore for %s", key)
+	logContext.Debug("Running restore")
 	// execution & upload of restore
-	restore.Status.Warnings, restore.Status.Errors = controller.runRestore(restore, controller.bucket)
+	restoreWarnings, restoreErrors := controller.runRestore(restore, controller.bucket)
 
-	glog.V(4).Infof("restore %s completed", key)
+	restore.Status.Warnings = len(restoreWarnings.Ark) + len(restoreWarnings.Cluster)
+	for _, w := range restoreWarnings.Namespaces {
+		restore.Status.Warnings += len(w)
+	}
+
+	restore.Status.Errors = len(restoreErrors.Ark) + len(restoreErrors.Cluster)
+	for _, e := range restoreErrors.Namespaces {
+		restore.Status.Errors += len(e)
+	}
+
+	logContext.Debug("restore completed")
 	restore.Status.Phase = api.RestorePhaseCompleted
 
-	glog.V(4).Infof("updating restore %s final status", key)
-	if _, err = controller.restoreClient.Restores(ns).Update(restore); err != nil {
-		glog.V(4).Infof("error updating restore %s final status: %v", key, err)
+	logContext.Debug("Updating Restore final status")
+	if _, err = patchRestore(original, restore, controller.restoreClient); err != nil {
+		logContext.WithError(errors.WithStack(err)).Info("Error updating Restore final status")
 	}
 
 	return nil
-}
-
-func cloneRestore(in interface{}) (*api.Restore, error) {
-	clone, err := scheme.Scheme.DeepCopy(in)
-	if err != nil {
-		return nil, err
-	}
-
-	out, ok := clone.(*api.Restore)
-	if !ok {
-		return nil, fmt.Errorf("unexpected type: %T", clone)
-	}
-
-	return out, nil
 }
 
 func (controller *restoreController) getValidationErrors(itm *api.Restore) []string {
@@ -273,40 +297,165 @@ func (controller *restoreController) getValidationErrors(itm *api.Restore) []str
 
 	if itm.Spec.BackupName == "" {
 		validationErrors = append(validationErrors, "BackupName must be non-empty and correspond to the name of a backup in object storage.")
+	} else if _, err := controller.fetchBackup(controller.bucket, itm.Spec.BackupName); err != nil {
+		validationErrors = append(validationErrors, fmt.Sprintf("Error retrieving backup: %v", err))
+	}
+
+	includedResources := sets.NewString(itm.Spec.IncludedResources...)
+	for _, nonRestorableResource := range nonRestorableResources {
+		if includedResources.Has(nonRestorableResource) {
+			validationErrors = append(validationErrors, fmt.Sprintf("%v are non-restorable resources", nonRestorableResource))
+		}
+	}
+
+	for _, err := range collections.ValidateIncludesExcludes(itm.Spec.IncludedNamespaces, itm.Spec.ExcludedNamespaces) {
+		validationErrors = append(validationErrors, fmt.Sprintf("Invalid included/excluded namespace lists: %v", err))
+	}
+
+	for _, err := range collections.ValidateIncludesExcludes(itm.Spec.IncludedResources, itm.Spec.ExcludedResources) {
+		validationErrors = append(validationErrors, fmt.Sprintf("Invalid included/excluded resource lists: %v", err))
+	}
+
+	if !controller.pvProviderExists && itm.Spec.RestorePVs != nil && *itm.Spec.RestorePVs {
+		validationErrors = append(validationErrors, "Server is not configured for PV snapshot restores")
 	}
 
 	return validationErrors
 }
 
-func (controller *restoreController) runRestore(restore *api.Restore, bucket string) (warnings, errors api.RestoreResult) {
-	backup, err := controller.backupLister.Backups(api.DefaultNamespace).Get(restore.Spec.BackupName)
+func (controller *restoreController) fetchBackup(bucket, name string) (*api.Backup, error) {
+	backup, err := controller.backupLister.Backups(controller.namespace).Get(name)
+	if err == nil {
+		return backup, nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return nil, errors.WithStack(err)
+	}
+
+	logContext := controller.logger.WithField("backupName", name)
+
+	logContext.Debug("Backup not found in backupLister, checking object storage directly")
+	backup, err = controller.backupService.GetBackup(bucket, name)
 	if err != nil {
-		glog.Errorf("error getting backup: %v", err)
-		errors.Cluster = append(errors.Ark, err.Error())
+		return nil, err
+	}
+
+	// ResourceVersion needs to be cleared in order to create the object in the API
+	backup.ResourceVersion = ""
+	// Clear out the namespace too, just in case
+	backup.Namespace = ""
+
+	created, createErr := controller.backupClient.Backups(controller.namespace).Create(backup)
+	if createErr != nil {
+		logContext.WithError(errors.WithStack(createErr)).Error("Unable to create API object for Backup")
+	} else {
+		backup = created
+	}
+
+	return backup, nil
+}
+
+func (controller *restoreController) runRestore(restore *api.Restore, bucket string) (restoreWarnings, restoreErrors api.RestoreResult) {
+	logContext := controller.logger.WithFields(
+		logrus.Fields{
+			"restore": kubeutil.NamespaceAndName(restore),
+			"backup":  restore.Spec.BackupName,
+		})
+
+	backup, err := controller.fetchBackup(bucket, restore.Spec.BackupName)
+	if err != nil {
+		logContext.WithError(err).Error("Error getting backup")
+		restoreErrors.Ark = append(restoreErrors.Ark, err.Error())
 		return
 	}
 
-	tmpFile, err := downloadToTempFile(restore.Spec.BackupName, controller.backupService, bucket)
+	var tempFiles []*os.File
+
+	backupFile, err := downloadToTempFile(restore.Spec.BackupName, controller.backupService, bucket, controller.logger)
 	if err != nil {
-		glog.Errorf("error downloading backup: %v", err)
-		errors.Cluster = append(errors.Ark, err.Error())
+		logContext.WithError(err).Error("Error downloading backup")
+		restoreErrors.Ark = append(restoreErrors.Ark, err.Error())
 		return
 	}
+	tempFiles = append(tempFiles, backupFile)
+
+	logFile, err := ioutil.TempFile("", "")
+	if err != nil {
+		logContext.WithError(errors.WithStack(err)).Error("Error creating log temp file")
+		restoreErrors.Ark = append(restoreErrors.Ark, err.Error())
+		return
+	}
+	tempFiles = append(tempFiles, logFile)
+
+	resultsFile, err := ioutil.TempFile("", "")
+	if err != nil {
+		logContext.WithError(errors.WithStack(err)).Error("Error creating results temp file")
+		restoreErrors.Ark = append(restoreErrors.Ark, err.Error())
+		return
+	}
+	tempFiles = append(tempFiles, resultsFile)
 
 	defer func() {
-		if err := tmpFile.Close(); err != nil {
-			errors.Cluster = append(errors.Ark, err.Error())
-		}
+		for _, file := range tempFiles {
+			if err := file.Close(); err != nil {
+				logContext.WithError(errors.WithStack(err)).WithField("file", file.Name()).Error("Error closing file")
+			}
 
-		if err := os.Remove(tmpFile.Name()); err != nil {
-			errors.Cluster = append(errors.Ark, err.Error())
+			if err := os.Remove(file.Name()); err != nil {
+				logContext.WithError(errors.WithStack(err)).WithField("file", file.Name()).Error("Error removing file")
+			}
 		}
 	}()
 
-	return controller.restorer.Restore(restore, backup, tmpFile)
+	actions, err := controller.pluginManager.GetRestoreItemActions(restore.Name)
+	if err != nil {
+		restoreErrors.Ark = append(restoreErrors.Ark, err.Error())
+		return
+	}
+	defer controller.pluginManager.CloseRestoreItemActions(restore.Name)
+
+	logContext.Info("starting restore")
+	restoreWarnings, restoreErrors = controller.restorer.Restore(restore, backup, backupFile, logFile, actions)
+	logContext.Info("restore completed")
+
+	// Try to upload the log file. This is best-effort. If we fail, we'll add to the ark errors.
+
+	// Reset the offset to 0 for reading
+	if _, err = logFile.Seek(0, 0); err != nil {
+		restoreErrors.Ark = append(restoreErrors.Ark, fmt.Sprintf("error resetting log file offset to 0: %v", err))
+		return
+	}
+
+	if err := controller.backupService.UploadRestoreLog(bucket, restore.Spec.BackupName, restore.Name, logFile); err != nil {
+		restoreErrors.Ark = append(restoreErrors.Ark, fmt.Sprintf("error uploading log file to object storage: %v", err))
+	}
+
+	m := map[string]api.RestoreResult{
+		"warnings": restoreWarnings,
+		"errors":   restoreErrors,
+	}
+
+	gzippedResultsFile := gzip.NewWriter(resultsFile)
+
+	if err := json.NewEncoder(gzippedResultsFile).Encode(m); err != nil {
+		logContext.WithError(errors.WithStack(err)).Error("Error encoding restore results")
+		return
+	}
+	gzippedResultsFile.Close()
+
+	if _, err = resultsFile.Seek(0, 0); err != nil {
+		logContext.WithError(errors.WithStack(err)).Error("Error resetting results file offset to 0")
+		return
+	}
+	if err := controller.backupService.UploadRestoreResults(bucket, restore.Spec.BackupName, restore.Name, resultsFile); err != nil {
+		logContext.WithError(errors.WithStack(err)).Error("Error uploading results files to object storage")
+	}
+
+	return
 }
 
-func downloadToTempFile(backupName string, backupService cloudprovider.BackupService, bucket string) (*os.File, error) {
+func downloadToTempFile(backupName string, backupService cloudprovider.BackupService, bucket string, logger logrus.FieldLogger) (*os.File, error) {
 	readCloser, err := backupService.DownloadBackup(bucket, backupName)
 	if err != nil {
 		return nil, err
@@ -315,19 +464,48 @@ func downloadToTempFile(backupName string, backupService cloudprovider.BackupSer
 
 	file, err := ioutil.TempFile("", backupName)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error creating Backup temp file")
 	}
 
 	n, err := io.Copy(file, readCloser)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error copying Backup to temp file")
 	}
-	glog.V(4).Infof("copied %d bytes", n)
+
+	logContext := logger.WithField("backup", backupName)
+
+	logContext.WithFields(logrus.Fields{
+		"fileName": file.Name(),
+		"bytes":    n,
+	}).Debug("Copied Backup to file")
 
 	if _, err := file.Seek(0, 0); err != nil {
-		glog.V(4).Infof("error seeking: %v", err)
-		return nil, err
+		return nil, errors.Wrap(err, "error resetting Backup file offset")
 	}
 
 	return file, nil
+}
+
+func patchRestore(original, updated *api.Restore, client arkv1client.RestoresGetter) (*api.Restore, error) {
+	origBytes, err := json.Marshal(original)
+	if err != nil {
+		return nil, errors.Wrap(err, "error marshalling original restore")
+	}
+
+	updatedBytes, err := json.Marshal(updated)
+	if err != nil {
+		return nil, errors.Wrap(err, "error marshalling updated restore")
+	}
+
+	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(origBytes, updatedBytes, api.Restore{})
+	if err != nil {
+		return nil, errors.Wrap(err, "error creating two-way merge patch for restore")
+	}
+
+	res, err := client.Restores(original.Namespace).Patch(original.Name, types.MergePatchType, patchBytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "error patching restore")
+	}
+
+	return res, nil
 }

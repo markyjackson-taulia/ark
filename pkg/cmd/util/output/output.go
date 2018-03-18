@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,16 +20,15 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/pkg/api"
 	"k8s.io/kubernetes/pkg/printers"
 
 	"github.com/heptio/ark/pkg/cmd/util/flag"
-	"github.com/heptio/ark/pkg/generated/clientset/scheme"
 	"github.com/heptio/ark/pkg/util/encode"
 )
 
@@ -85,7 +84,7 @@ func validateOutputFlag(cmd *cobra.Command) error {
 	switch output {
 	case "", "table", "json", "yaml":
 	default:
-		return fmt.Errorf("invalid output format %q - valid values are 'table', 'json', and 'yaml'", output)
+		return errors.Errorf("invalid output format %q - valid values are 'table', 'json', and 'yaml'", output)
 	}
 	return nil
 }
@@ -105,7 +104,7 @@ func PrintWithFormat(c *cobra.Command, obj runtime.Object) (bool, error) {
 		return printEncoded(obj, format)
 	}
 
-	return false, fmt.Errorf("unsupported output format %q; valid values are 'table', 'json', and 'yaml'", format)
+	return false, errors.Errorf("unsupported output format %q; valid values are 'table', 'json', and 'yaml'", format)
 }
 
 func printEncoded(obj runtime.Object, format string) (bool, error) {
@@ -154,11 +153,6 @@ func printTable(cmd *cobra.Command, obj runtime.Object) (bool, error) {
 // NewPrinter returns a printer for doing human-readable table printing of
 // Ark objects.
 func NewPrinter(cmd *cobra.Command) (*printers.HumanReadablePrinter, error) {
-	encoder, err := encode.EncoderFor("json")
-	if err != nil {
-		return nil, err
-	}
-
 	options := printers.PrintOptions{
 		NoHeaders:    flag.GetOptionalBoolFlag(cmd, "no-headers"),
 		ShowLabels:   GetShowLabelsValue(cmd),
@@ -166,8 +160,8 @@ func NewPrinter(cmd *cobra.Command) (*printers.HumanReadablePrinter, error) {
 	}
 
 	printer := printers.NewHumanReadablePrinter(
-		encoder,
-		scheme.Codecs.UniversalDecoder(api.SchemeGroupVersion),
+		nil, // encoder, only needed if we want/need to convert unstructured/unknown to typed objects
+		nil, // decoder, only needed if we want/need to convert unstructured/unknown to typed objects
 		options,
 	)
 

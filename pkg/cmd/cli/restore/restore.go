@@ -1,5 +1,5 @@
 /*
-Copyright 2017 Heptio Inc.
+Copyright 2017 the Heptio Ark contributors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,11 +30,11 @@ func NewCommand(f client.Factory) *cobra.Command {
 	}
 
 	c.AddCommand(
-		NewCreateCommand(f),
-		NewGetCommand(f),
-		// Will implement later
-		// NewDescribeCommand(f),
-		NewDeleteCommand(f),
+		NewCreateCommand(f, "create"),
+		NewGetCommand(f, "get"),
+		NewLogsCommand(f),
+		NewDescribeCommand(f, "describe"),
+		NewDeleteCommand(f, "delete"),
 	)
 
 	return c
